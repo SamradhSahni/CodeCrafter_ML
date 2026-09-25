@@ -1,0 +1,30 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+pyarrow>=12.0
+tqdm>=4.65
+joblib>=1.3
+
+# ML Model
+lightgbm>=4.5
+
+# Text Processing
+rapidfuzz>=3.0
+jellyfish>=1.0
+unidecode>=1.3
+ftfy>=6.0
+regex>=2023.0
+
+# Sparse Retrieval
+sparse_dot_topn>=1.0
+
+# Dense Retrieval (GPU)
+torch>=2.0
+sentence-transformers>=2.7
+faiss-cpu>=1.7
+
+# Note: For GPU FAISS, install faiss-gpu instead:
+#   pip install faiss-gpu
+# For PyTorch with CUDA (if not auto-detected):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
