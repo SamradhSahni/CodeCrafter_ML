@@ -367,46 +367,36 @@ def _process_chunk(chunk_df):
 
 @timed
 def preprocess_dataframe(df: pd.DataFrame, source_label: str,
-                         n_jobs: int = -1, chunk_size: int = 5000) -> pd.DataFrame:
+                         chunk_size: int = 50000) -> pd.DataFrame:
     """
-    Preprocess an entire source DataFrame using parallel processing.
+    Preprocess an entire source DataFrame.
+
+    Uses streaming approach: process rows sequentially with tqdm,
+    flush to list periodically. Memory-safe for 16GB RAM machines.
 
     Args:
         df: Raw DataFrame with entity_id, business_name, business_address, country
         source_label: Label for logging (e.g. "train_S1")
-        n_jobs: Number of parallel workers (-1 = all cores)
-        chunk_size: Rows per chunk for parallelization
+        chunk_size: Rows to accumulate before logging progress
     """
     logger.info(f"Preprocessing {source_label}: {len(df):,} records ...")
 
     n = len(df)
-    if n <= chunk_size * 2:
-        # Small enough to process serially (no joblib overhead)
-        records = []
-        for _, row in tqdm(df.iterrows(), total=n, desc=f"Preprocess {source_label}"):
-            eid = row["entity_id"]
-            rec = preprocess_record(
-                row.get("business_name", ""),
-                row.get("business_address", ""),
-                row.get("country", ""),
-            )
-            rec["entity_id"] = eid
-            records.append(rec)
-    else:
-        # Parallel processing with joblib
-        chunks = [df.iloc[i:i + chunk_size] for i in range(0, n, chunk_size)]
-        logger.info(f"  Parallel processing: {len(chunks)} chunks × {chunk_size} rows, "
-                     f"{n_jobs} workers")
+    records = []
 
-        chunk_results = Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
-            delayed(_process_chunk)(chunk) for chunk in chunks
+    for _, row in tqdm(df.iterrows(), total=n, desc=f"Preprocess {source_label}"):
+        eid = row["entity_id"]
+        rec = preprocess_record(
+            row.get("business_name", ""),
+            row.get("business_address", ""),
+            row.get("country", ""),
         )
-        records = []
-        for chunk_result in chunk_results:
-            records.extend(chunk_result)
+        rec["entity_id"] = eid
+        records.append(rec)
 
     result = pd.DataFrame(records)
     result = result.set_index("entity_id")
     logger.info(f"  -> {source_label} preprocessed: {len(result):,} records, "
                 f"{len(result.columns)} columns")
     return result
+
