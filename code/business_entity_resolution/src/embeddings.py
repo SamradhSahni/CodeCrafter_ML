@@ -209,17 +209,17 @@ def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None,
 
 @timed
 def search_faiss(query_vectors: np.ndarray, index: faiss.Index,
-                 k: int = 50, batch_size: int = 10_000):
+                 k: int = 30, batch_size: int = 10_000):
     """
     Batch-search FAISS index for top-K neighbors.
     Returns (distances, indices) arrays of shape (n_queries, k).
-    Memory-safe: copies only one batch at a time to contiguous array.
+    Memory-safe: uses int32 indices and copies only one batch at a time.
     """
     n = query_vectors.shape[0]
     logger.info(f"FAISS search: {n:,} queries, top-{k} ...")
 
     all_distances = np.zeros((n, k), dtype=np.float32)
-    all_indices = np.full((n, k), -1, dtype=np.int64)
+    all_indices = np.full((n, k), -1, dtype=np.int32)
 
     for start in tqdm(range(0, n, batch_size), desc="FAISS search"):
         end = min(start + batch_size, n)
@@ -228,7 +228,7 @@ def search_faiss(query_vectors: np.ndarray, index: faiss.Index,
         )
         distances, indices = index.search(batch, k)
         all_distances[start:end] = distances
-        all_indices[start:end] = indices
+        all_indices[start:end] = indices.astype(np.int32)
         del batch
 
     logger.info(f"  -> Search complete: {n * k:,} results")
@@ -245,8 +245,10 @@ def run_embedding_blocking(s1_ids: np.ndarray, cand_ids: np.ndarray,
     """
     Run FAISS-based blocking using pre-computed embeddings.
     Returns candidates dict and provenance dict.
+    Prunes low-similarity candidates beyond top-3 to minimize RAM.
     """
     topk = topk or config.FAISS_TOP_K
+    min_sim = getattr(config, "FAISS_MIN_SIMILARITY", 0.35)
 
     # Build index on candidates (S2+S3)
     index = build_faiss_index(cand_embeddings)
@@ -264,13 +266,19 @@ def run_embedding_blocking(s1_ids: np.ndarray, cand_ids: np.ndarray,
             j = int(indices[i, rank])
             if j < 0 or j >= len(cand_ids):
                 continue
-            cand_id = cand_ids[j]
             score = float(distances[i, rank])
+            # Keep top-3 unconditionally; for rank >= 3, keep only if score >= min_sim
+            if rank >= 3 and score < min_sim:
+                continue
+            cand_id = cand_ids[j]
             candidates[s1_id].add(cand_id)
             provenance[(s1_id, cand_id)] = {
                 "embedding_rank": rank,
-                "embedding_score": score,
+                "embedding_score": round(score, 4),
             }
+
+    del distances, indices
+    gc.collect()
 
     avg_cands = np.mean([len(v) for v in candidates.values()]) if candidates else 0
     logger.info(f"Embedding blocking: {sum(len(v) for v in candidates.values()):,} pairs, "
@@ -294,39 +302,59 @@ def run_embedding_reciprocal(s1_ids: np.ndarray, cand_ids: np.ndarray,
                              forward_provenance: dict, topk: int = 20):
     """
     Independent reverse retrieval: S2S3 → S1 using embeddings.
-    Joins with forward to produce reciprocal rank features.
+    Optimized: queries ONLY unique candidates that appear in forward retrieval,
+    reducing queries from 10.3M to ~500k and saving >90% RAM and compute time.
     """
+    if not forward_provenance:
+        return {}
+
+    # Identify unique candidates in forward provenance
+    cand_id_to_idx = {eid: i for i, eid in enumerate(cand_ids)}
+    unique_cand_ids = [cid for cid in {cid for (_, cid) in forward_provenance.keys()} if cid in cand_id_to_idx]
+    if not unique_cand_ids:
+        return {}
+
+    unique_cand_indices = np.array([cand_id_to_idx[cid] for cid in unique_cand_ids], dtype=np.int32)
+    logger.info(f"Reverse FAISS: querying {len(unique_cand_ids):,} unique candidates against S1 index ...")
+
     # Build index on S1
     index_s1 = build_faiss_index(s1_embeddings)
 
-    # Search: S2S3 queries against S1 corpus
-    distances, indices = search_faiss(cand_embeddings, index_s1, k=topk)
+    # Search in batches directly from cand_embeddings mmap
+    n_queries = len(unique_cand_ids)
+    batch_size = 10_000
+    reverse_ranks = {}  # cand_id -> {s1_id: rank}
 
-    # Build reverse lookup: cand_idx -> {s1_idx: rank}
-    s1_id_to_idx = {eid: i for i, eid in enumerate(s1_ids)}
-    cand_id_to_idx = {eid: i for i, eid in enumerate(cand_ids)}
+    for start in tqdm(range(0, n_queries, batch_size), desc="FAISS reverse search"):
+        end = min(start + batch_size, n_queries)
+        batch_cand_indices = unique_cand_indices[start:end]
+        batch = np.ascontiguousarray(cand_embeddings[batch_cand_indices].astype(np.float32))
+        _, indices = index_s1.search(batch, topk)
+        del batch
 
-    reverse_ranks = {}
-    for cand_idx in range(len(cand_ids)):
-        rank_map = {}
-        for rank in range(topk):
-            s1_local_idx = int(indices[cand_idx, rank])
-            if s1_local_idx < 0 or s1_local_idx >= len(s1_ids):
-                continue
-            rank_map[s1_local_idx] = rank
-        if rank_map:
-            reverse_ranks[cand_idx] = rank_map
+        for local_i, global_i in enumerate(range(start, end)):
+            cid = unique_cand_ids[global_i]
+            rank_map = {}
+            for rank in range(topk):
+                s1_idx = int(indices[local_i, rank])
+                if 0 <= s1_idx < len(s1_ids):
+                    rank_map[s1_ids[s1_idx]] = rank
+            if rank_map:
+                reverse_ranks[cid] = rank_map
+        del indices
+
+    # Clean up index early
+    del index_s1
+    gc.collect()
+    if config.HAS_CUDA:
+        torch.cuda.empty_cache()
 
     # Join forward + reverse
     reciprocal = {}
     for (s1_id, cand_id), prov in forward_provenance.items():
-        s1_idx = s1_id_to_idx.get(s1_id)
-        cand_idx = cand_id_to_idx.get(cand_id)
-        if s1_idx is None or cand_idx is None:
-            continue
         fwd_rank = prov.get("embedding_rank", 999)
-        rev_rank_map = reverse_ranks.get(cand_idx, {})
-        rev_rank = rev_rank_map.get(s1_idx, -1)
+        rev_rank_map = reverse_ranks.get(cand_id, {})
+        rev_rank = rev_rank_map.get(s1_id, -1)
 
         reciprocal[(s1_id, cand_id)] = {
             "emb_fwd_rank": fwd_rank,
@@ -339,14 +367,12 @@ def run_embedding_reciprocal(s1_ids: np.ndarray, cand_ids: np.ndarray,
             ),
         }
 
-    # Clean up
-    del index_s1
+    del reverse_ranks, cand_id_to_idx, unique_cand_indices, unique_cand_ids
     gc.collect()
-    if config.HAS_CUDA:
-        torch.cuda.empty_cache()
 
     logger.info(f"Embedding reciprocal: {len(reciprocal):,} pairs with features")
     return reciprocal
+
 
 
 # ──────────────────────────────────────────────

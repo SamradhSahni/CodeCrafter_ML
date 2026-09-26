@@ -354,10 +354,10 @@ def run_features_phase(pp_train_s1, pp_train_s2s3, candidates, provenance,
     )
 
     # Labels
-    labels = []
-    for s1_id, cand_id in pairs:
-        true = ground_truth.get(s1_id, set())
-        labels.append(1 if cand_id in true else 0)
+    labels = np.zeros(len(pairs), dtype=np.int32)
+    for i, (s1_id, cand_id) in enumerate(pairs):
+        if cand_id in ground_truth.get(s1_id, set()):
+            labels[i] = 1
     feature_df["label"] = labels
 
     feature_df.to_parquet(config.CACHE_DIR / "train_features.parquet")
@@ -424,6 +424,11 @@ def run_training_phase(feature_df, ground_truth):
             X_train_aug = np.vstack([X_train, X[hn_indices]])
             y_train_aug = np.concatenate([y_train, y[hn_indices]])
             stage1_model = mdl.train_model(X_train_aug, y_train_aug, X_val, y_val)
+            del X_train_aug, y_train_aug
+            free_memory()
+
+    del X
+    free_memory()
 
     # --- Stage 2: density features ---
     logger.info("\n--- Stage 2: Two-stage with OOF density ---")
@@ -575,8 +580,9 @@ def run_inference_phase(pp_test_s1, pp_test_s2, pp_test_s3,
     s2_probs = stage2_model.predict_proba(X_test_s2)[:, 1]
 
     # Per-country threshold
+    s1_country_map = pp_test_s1["country"].to_dict()
     countries_arr = np.array([
-        pp_test_s1.loc[s, "country"] if s in pp_test_s1.index else ""
+        s1_country_map.get(s, "")
         for s in s1_arr
     ])
 
@@ -647,13 +653,16 @@ def run_full_pipeline(nrows=None):
     del pp_train_s1_block, pp_train_s2s3_block
     free_memory()
 
-    # Phase 4: Features (load full DataFrames)
-    logger.info("Loading full train data for feature computation ...")
-    pp_train_s1 = pd.read_parquet(config.CACHE_DIR / "pp_train_s1.parquet")
-    pp_train_s2s3 = pd.concat([
-        pd.read_parquet(config.CACHE_DIR / "pp_train_s2.parquet"),
-        pd.read_parquet(config.CACHE_DIR / "pp_train_s3.parquet"),
-    ])
+    # Phase 4: Features (load only needed feature columns)
+    logger.info("Loading train data for feature computation (needed columns only) ...")
+    feat_cols = ["name_clean", "name_core", "addr_clean", "country", "postal_code",
+                 "city", "state", "street_number", "landmark_tokens", "is_url_name",
+                 "generic_tokens", "url_stem", "script_type", "legal_suffix", "name_unicode"]
+    pp_train_s1 = pd.read_parquet(config.CACHE_DIR / "pp_train_s1.parquet", columns=feat_cols)
+    pp_train_s2 = pd.read_parquet(config.CACHE_DIR / "pp_train_s2.parquet", columns=feat_cols)
+    pp_train_s3 = pd.read_parquet(config.CACHE_DIR / "pp_train_s3.parquet", columns=feat_cols)
+    pp_train_s2s3 = pd.concat([pp_train_s2, pp_train_s3])
+    del pp_train_s2, pp_train_s3
     free_memory()
 
     feature_df = run_features_phase(

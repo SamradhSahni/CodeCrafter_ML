@@ -3,6 +3,7 @@ Phase 3: Feature engineering — 60+ features across 8 categories.
 
 All features are computed ONLY for candidate pairs from blocking (Phase 2).
 """
+import gc
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
@@ -268,45 +269,96 @@ def compute_pair_features(s1_rec: dict, cand_rec: dict,
 # ──────────────────────────────────────────────
 #  Batch feature computation
 # ──────────────────────────────────────────────
+#  Batch feature computation
+# ──────────────────────────────────────────────
 @timed
 def compute_features_batch(pairs: list, s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
                            provenance: dict, reciprocal: dict, token_idf: dict,
                            embedding_provenance: dict = None,
-                           embedding_reciprocal: dict = None) -> pd.DataFrame:
+                           embedding_reciprocal: dict = None,
+                           chunk_size: int = 100_000) -> pd.DataFrame:
     """
-    Compute features for all candidate pairs.
-    pairs: list of (s1_id, cand_id) tuples.
-    Returns DataFrame of features.
+    Compute features for all candidate pairs with minimal memory footprint.
+    Pre-extracts record dicts to eliminate slow/memory-heavy .loc lookups,
+    processes in chunks, and downcasts numeric features to float32.
     """
     logger.info(f"Computing features for {len(pairs):,} pairs ...")
     embedding_provenance = embedding_provenance or {}
     embedding_reciprocal = embedding_reciprocal or {}
 
-    feature_rows = []
-    for s1_id, cand_id in tqdm(pairs, desc="Features"):
-        s1_rec = s1_df.loc[s1_id].to_dict() if s1_id in s1_df.index else {}
-        cand_rec = s2s3_df.loc[cand_id].to_dict() if cand_id in s2s3_df.index else {}
+    needed_cols = [c for c in [
+        "name_clean", "name_core", "addr_clean", "country", "postal_code",
+        "city", "state", "street_number", "landmark_tokens", "is_url_name",
+        "generic_tokens", "url_stem", "script_type", "legal_suffix", "name_unicode"
+    ] if c in s1_df.columns]
 
-        # Add entity_id prefix for source_type feature
-        cand_rec["entity_id_prefix"] = cand_id[:2] if cand_id else ""
+    pair_s1_ids = list({s1 for s1, _ in pairs})
+    pair_cand_ids = list({c for _, c in pairs})
 
-        prov = provenance.get((s1_id, cand_id), {})
-        recip = reciprocal.get((s1_id, cand_id), {})
-        emb_prov = embedding_provenance.get((s1_id, cand_id), {})
-        emb_recip = embedding_reciprocal.get((s1_id, cand_id), {})
+    logger.info(f"  Pre-extracting {len(pair_s1_ids):,} S1 and {len(pair_cand_ids):,} candidate records ...")
+    s1_sub = s1_df.loc[s1_df.index.intersection(pair_s1_ids), needed_cols]
+    s1_records = s1_sub.to_dict(orient="index")
+    del s1_sub
 
-        feats = compute_pair_features(
-            s1_rec, cand_rec, prov, recip, token_idf,
-            embedding_provenance=emb_prov,
-            embedding_reciprocal=emb_recip,
-        )
-        feats["s1_id"] = s1_id
-        feats["cand_id"] = cand_id
-        feature_rows.append(feats)
+    needed_cand_cols = [c for c in needed_cols if c in s2s3_df.columns]
+    cand_sub = s2s3_df.loc[s2s3_df.index.intersection(pair_cand_ids), needed_cand_cols]
+    cand_records = cand_sub.to_dict(orient="index")
+    del cand_sub
+    gc.collect()
 
-    df = pd.DataFrame(feature_rows)
+    chunk_dfs = []
+    n_pairs = len(pairs)
+
+    for start in range(0, n_pairs, chunk_size):
+        end = min(start + chunk_size, n_pairs)
+        batch_pairs = pairs[start:end]
+        feature_rows = []
+
+        for s1_id, cand_id in batch_pairs:
+            s1_rec = s1_records.get(s1_id, {})
+            cand_rec = dict(cand_records.get(cand_id, {}))
+
+            # Add entity_id prefix for source_type feature
+            cand_rec["entity_id_prefix"] = cand_id[:2] if cand_id else ""
+
+            prov = provenance.get((s1_id, cand_id), {})
+            recip = reciprocal.get((s1_id, cand_id), {})
+            emb_prov = embedding_provenance.get((s1_id, cand_id), {})
+            emb_recip = embedding_reciprocal.get((s1_id, cand_id), {})
+
+            feats = compute_pair_features(
+                s1_rec, cand_rec, prov, recip, token_idf,
+                embedding_provenance=emb_prov,
+                embedding_reciprocal=emb_recip,
+            )
+            feats["s1_id"] = s1_id
+            feats["cand_id"] = cand_id
+            feature_rows.append(feats)
+
+        chunk_df = pd.DataFrame(feature_rows)
+        del feature_rows
+
+        # Downcast float64 to float32 to halve memory usage
+        float_cols = chunk_df.select_dtypes(include=["float64"]).columns
+        if len(float_cols) > 0:
+            chunk_df[float_cols] = chunk_df[float_cols].astype(np.float32)
+
+        chunk_dfs.append(chunk_df)
+        gc.collect()
+
+    del s1_records, cand_records
+    gc.collect()
+
+    if chunk_dfs:
+        df = pd.concat(chunk_dfs, ignore_index=True)
+        del chunk_dfs
+        gc.collect()
+    else:
+        df = pd.DataFrame()
+
     logger.info(f"  -> Feature matrix: {df.shape[0]:,} rows x {df.shape[1]} columns")
     return df
+
 
 
 # ──────────────────────────────────────────────

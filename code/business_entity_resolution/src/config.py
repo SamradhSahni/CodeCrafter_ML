@@ -51,8 +51,11 @@ except ImportError:
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim, fast, reliable
 EMBEDDING_DIM = 384
 EMBEDDING_BATCH_SIZE = 1024 if HAS_CUDA else 256
-FAISS_TOP_K = 50                     # top-K from dense retrieval
-FAISS_NPROBE = 64                    # IVF search granularity
+FAISS_TOP_K = 30                     # top-K from dense retrieval (reduced from 50 for memory safety)
+FAISS_NPROBE = 32                    # IVF search granularity (reduced from 64 for 2x faster CPU search)
+FAISS_MIN_SIMILARITY = 0.35          # minimum cosine similarity for dense retrieval candidates
+BLOCKING_MAX_CANDS_PER_ENTITY = 50   # max candidates per S1 entity across all blockers
+INVERTED_INDEX_MAX_BUCKET = 200      # max bucket size to prevent non-selective combinatorial explosion
 
 # ──────────────────────────────────────────────
 #  Legal suffixes vs generic business tokens

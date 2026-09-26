@@ -273,6 +273,9 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
     gc.collect()
     logger.info(f"  After addr TF-IDF: {sum(len(v) for v in all_candidates.values()):,} pairs")
 
+    max_bucket = getattr(config, "INVERTED_INDEX_MAX_BUCKET", 200)
+    max_cands = getattr(config, "BLOCKING_MAX_CANDS_PER_ENTITY", 50)
+
     # ── Strategy 3: Phonetic blocking ──
     logger.info(f"  Strategy 3: Phonetic blocking ...")
     # Use pre-computed phonetic_key if available, otherwise compute on the fly
@@ -295,11 +298,17 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
 
     phonetic_pairs = 0
     for s1_id, pkey in s1_phonetic.items():
+        if len(all_candidates[s1_id]) >= max_cands:
+            continue
         if pkey and pkey in phonetic_index:
-            for cand_id in phonetic_index[pkey]:
-                all_candidates[s1_id].add(cand_id)
-                provenance[(s1_id, cand_id)]["phonetic_hit"] = True
-                phonetic_pairs += 1
+            bucket = phonetic_index[pkey]
+            if len(bucket) <= max_bucket:
+                for cand_id in bucket:
+                    if len(all_candidates[s1_id]) >= max_cands:
+                        break
+                    all_candidates[s1_id].add(cand_id)
+                    provenance[(s1_id, cand_id)]["phonetic_hit"] = True
+                    phonetic_pairs += 1
 
     del phonetic_index
     gc.collect()
@@ -319,15 +328,23 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
 
     rare_pairs = 0
     for s1_id, row in s1_df.iterrows():
+        if len(all_candidates[s1_id]) >= max_cands:
+            continue
         if not row["name_core"]:
             continue
         for t in row["name_core"].split():
+            if len(all_candidates[s1_id]) >= max_cands:
+                break
             if token_idf.get(t, 0) > config.RARE_TOKEN_IDF_THRESHOLD:
                 if t in rare_token_index:
-                    for cand_id in rare_token_index[t]:
-                        all_candidates[s1_id].add(cand_id)
-                        provenance[(s1_id, cand_id)]["rare_token_hit"] = True
-                        rare_pairs += 1
+                    bucket = rare_token_index[t]
+                    if len(bucket) <= max_bucket:
+                        for cand_id in bucket:
+                            if len(all_candidates[s1_id]) >= max_cands:
+                                break
+                            all_candidates[s1_id].add(cand_id)
+                            provenance[(s1_id, cand_id)]["rare_token_hit"] = True
+                            rare_pairs += 1
 
     del rare_token_index
     gc.collect()
@@ -344,13 +361,19 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
 
     postal_pairs = 0
     for s1_id, row in s1_df.iterrows():
+        if len(all_candidates[s1_id]) >= max_cands:
+            continue
         if row["postal_code"] and row["name_core"]:
             key = f"{row['postal_code']}_{row['name_core'][:3]}"
             if key in postal_index:
-                for cand_id in postal_index[key]:
-                    all_candidates[s1_id].add(cand_id)
-                    provenance[(s1_id, cand_id)]["postal_hit"] = True
-                    postal_pairs += 1
+                bucket = postal_index[key]
+                if len(bucket) <= max_bucket:
+                    for cand_id in bucket:
+                        if len(all_candidates[s1_id]) >= max_cands:
+                            break
+                        all_candidates[s1_id].add(cand_id)
+                        provenance[(s1_id, cand_id)]["postal_hit"] = True
+                        postal_pairs += 1
 
     del postal_index
     gc.collect()
@@ -370,16 +393,24 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
 
     city_pairs = 0
     for s1_id, row in s1_df.iterrows():
+        if len(all_candidates[s1_id]) >= max_cands:
+            continue
         if row["city"] and row["name_core"] and len(row["name_core"]) >= 2:
             bigrams = {row["name_core"][i:i+2] for i in range(len(row["name_core"]) - 1)
                        if row["name_core"][i:i+2].strip()}
             for bg in bigrams:
+                if len(all_candidates[s1_id]) >= max_cands:
+                    break
                 key = f"{row['city']}_{bg}"
                 if key in city_index:
-                    for cand_id in city_index[key]:
-                        all_candidates[s1_id].add(cand_id)
-                        provenance[(s1_id, cand_id)]["city_hit"] = True
-                        city_pairs += 1
+                    bucket = city_index[key]
+                    if len(bucket) <= max_bucket:
+                        for cand_id in bucket:
+                            if len(all_candidates[s1_id]) >= max_cands:
+                                break
+                            all_candidates[s1_id].add(cand_id)
+                            provenance[(s1_id, cand_id)]["city_hit"] = True
+                            city_pairs += 1
 
     del city_index
     gc.collect()
@@ -418,45 +449,59 @@ def run_reciprocal_retrieval(s1_name_vecs, s2s3_name_vecs, s1_ids, cand_ids,
     """
     Run INDEPENDENT reverse retrieval: S2S3 -> S1.
     Joins with forward retrieval to produce reciprocal rank features.
-
-    Returns: {(s1_id, cand_id): reciprocal_features_dict}
+    Optimized: queries ONLY unique candidates that appear in forward_candidates,
+    drastically lowering memory and CPU time.
     """
-    logger.info(f"Running reciprocal retrieval: {s2s3_name_vecs.shape[0]:,} S2S3 -> "
+    if not forward_candidates:
+        return {}
+
+    cand_idx_map = {eid: i for i, eid in enumerate(cand_ids)}
+    unique_cand_ids = list({cand_id for cands in forward_candidates.values() for cand_id, _, _ in cands if cand_id in cand_idx_map})
+    if not unique_cand_ids:
+        return {}
+
+    sub_cand_indices = [cand_idx_map[cid] for cid in unique_cand_ids]
+    sub_s2s3_vecs = s2s3_name_vecs[sub_cand_indices]
+
+    logger.info(f"Running reciprocal retrieval: {len(unique_cand_ids):,} unique S2S3 -> "
                 f"{s1_name_vecs.shape[0]:,} S1, top-{topk} ...")
 
-    # Independent reverse: S2S3 queries against S1 corpus
+    # Independent reverse: unique S2S3 queries against S1 corpus
     try:
         reverse_sim = awesome_cossim_topn(
-            s2s3_name_vecs, s1_name_vecs.T,
+            sub_s2s3_vecs, s1_name_vecs.T,
             ntop=topk, lower_bound=config.TFIDF_MIN_SIMILARITY,
             use_threads=True, n_jobs=4,
         )
     except TypeError:
         reverse_sim = awesome_cossim_topn(
-            s2s3_name_vecs, s1_name_vecs.T,
+            sub_s2s3_vecs, s1_name_vecs.T,
             ntop=topk, lower_bound=config.TFIDF_MIN_SIMILARITY,
         )
 
     logger.info(f"  Reverse retrieval: {reverse_sim.nnz:,} pairs")
 
-    # Build reverse index: cand_idx -> {s1_idx: rank}
-    cand_idx_map = {eid: i for i, eid in enumerate(cand_ids)}
+    # Build reverse index directly using CSR arrays (fast & memory-efficient)
+    indptr = reverse_sim.indptr
+    indices = reverse_sim.indices
+    data = reverse_sim.data
     s1_idx_map = {eid: i for i, eid in enumerate(s1_ids)}
 
-    reverse_ranks = {}  # cand_idx -> {s1_idx: rank}
-    for cand_idx in range(reverse_sim.shape[0]):
-        row = reverse_sim.getrow(cand_idx)
-        if row.nnz == 0:
+    reverse_ranks = {}  # cand_id -> {s1_local_idx: rank}
+    for local_idx, cid in enumerate(unique_cand_ids):
+        start, end = indptr[local_idx], indptr[local_idx + 1]
+        if start == end:
             continue
-        # Sort by score descending for ranking
-        order = np.argsort(-row.data)
+        row_indices = indices[start:end]
+        row_data = data[start:end]
+        order = np.argsort(-row_data)
         rank_map = {}
         for rank, pos in enumerate(order):
-            s1_local_idx = row.indices[pos]
+            s1_local_idx = row_indices[pos]
             rank_map[s1_local_idx] = rank
-        reverse_ranks[cand_idx] = rank_map
+        reverse_ranks[cid] = rank_map
 
-    del reverse_sim
+    del reverse_sim, sub_s2s3_vecs
     gc.collect()
 
     # Join forward + reverse ranks
@@ -466,10 +511,7 @@ def run_reciprocal_retrieval(s1_name_vecs, s2s3_name_vecs, s1_ids, cand_ids,
         if s1_idx is None:
             continue
         for cand_id, fwd_rank, fwd_score in cands:
-            cand_idx = cand_idx_map.get(cand_id)
-            if cand_idx is None:
-                continue
-            rev_rank_map = reverse_ranks.get(cand_idx, {})
+            rev_rank_map = reverse_ranks.get(cand_id, {})
             rev_rank = rev_rank_map.get(s1_idx, -1)
 
             reciprocal_features[(s1_id, cand_id)] = {
@@ -482,6 +524,9 @@ def run_reciprocal_retrieval(s1_name_vecs, s2s3_name_vecs, s1_ids, cand_ids,
                     if rev_rank >= 0 else 0.0
                 ),
             }
+
+    del reverse_ranks, s1_idx_map, cand_idx_map, unique_cand_ids
+    gc.collect()
 
     logger.info(f"  Reciprocal features computed for {len(reciprocal_features):,} pairs")
     return reciprocal_features
