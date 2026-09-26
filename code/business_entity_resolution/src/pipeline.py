@@ -79,12 +79,15 @@ def run_preprocess(nrows=None):
 # ──────────────────────────────────────────────
 @timed
 def run_embedding_phase():
-    """Compute sentence-transformer embeddings for all preprocessed sources."""
+    """Compute sentence-transformer embeddings for all preprocessed sources.
+    Memory-safe: encodes in 500K-row chunks, saves directly to .npy on disk.
+    """
     logger.info("=" * 60)
     logger.info(f"PHASE 2: EMBEDDING GENERATION ({config.GPU_NAME})")
     logger.info("=" * 60)
 
     cache = config.CACHE_DIR
+    CHUNK_SIZE = 500_000  # encode this many texts at a time
 
     # Check if all embeddings already cached
     emb_files = [
@@ -113,13 +116,60 @@ def run_embedding_phase():
             logger.info(f"  {label}: embedding cached, skipping")
             continue
 
-        df = pd.read_parquet(cache / pp_file)
-        # Combine name + address for richer embedding
+        # Only load the columns we need
+        df = pd.read_parquet(cache / pp_file, columns=["name_clean", "addr_clean"])
+        n = len(df)
         texts = (df["name_clean"].fillna("") + " " + df["addr_clean"].fillna("")).tolist()
-        vectors = emb.encode_texts(model, texts, desc=label)
-        np.save(emb_path, vectors)
-        del df, texts, vectors
+        del df
         free_memory()
+
+        logger.info(f"  {label}: encoding {n:,} texts in chunks of {CHUNK_SIZE:,} ...")
+
+        # Encode in chunks and save to temp files
+        chunk_paths = []
+        dim = None
+        for start in range(0, n, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, n)
+            chunk_texts = texts[start:end]
+            logger.info(f"    Chunk {start:,}-{end:,} ...")
+
+            chunk_emb = model.encode(
+                [t if t and t.strip() else " " for t in chunk_texts],
+                batch_size=config.EMBEDDING_BATCH_SIZE,
+                show_progress_bar=True,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            ).astype(np.float32)
+
+            if dim is None:
+                dim = chunk_emb.shape[1]
+
+            chunk_path = cache / f"_emb_chunk_{label}_{start}.npy"
+            np.save(chunk_path, chunk_emb)
+            chunk_paths.append(chunk_path)
+            del chunk_emb, chunk_texts
+            free_memory()
+
+        del texts
+        free_memory()
+
+        # Merge chunks into final file using memory-mapped output
+        logger.info(f"  Merging {len(chunk_paths)} chunks -> {emb_file} ...")
+        # Pre-allocate output file as memory-mapped
+        fp = np.lib.format.open_memmap(
+            str(emb_path), mode='w+', dtype=np.float32, shape=(n, dim)
+        )
+        offset = 0
+        for cp in chunk_paths:
+            chunk = np.load(cp)
+            fp[offset:offset + len(chunk)] = chunk
+            offset += len(chunk)
+            del chunk
+            cp.unlink()
+        fp.flush()
+        del fp
+        free_memory()
+        logger.info(f"  -> {label}: saved {emb_path.name} ({n:,} x {dim})")
 
     del model
     free_memory()
@@ -150,14 +200,29 @@ def run_blocking_phase(pp_train_s1, pp_train_s2, pp_train_s3, ground_truth):
     pd.Series(token_idf).to_frame("idf").to_parquet(config.CACHE_DIR / "token_idf.parquet")
     logger.info(f"Token IDF: {len(token_idf):,} tokens")
 
-    # Load embeddings
+    # Load embeddings using memory-mapping to avoid OOM
     cache = config.CACHE_DIR
-    emb_s1 = np.load(cache / "emb_train_s1.npy")
-    emb_s2 = np.load(cache / "emb_train_s2.npy")
-    emb_s3 = np.load(cache / "emb_train_s3.npy")
-    emb_s2s3 = np.vstack([emb_s2, emb_s3])
+    emb_s1 = np.load(cache / "emb_train_s1.npy", mmap_mode="r")
+    emb_s2 = np.load(cache / "emb_train_s2.npy", mmap_mode="r")
+    emb_s3 = np.load(cache / "emb_train_s3.npy", mmap_mode="r")
+    n_s2s3 = len(emb_s2) + len(emb_s3)
+    dim = emb_s1.shape[1]
+    logger.info(f"Embeddings: S1={len(emb_s1):,}, S2={len(emb_s2):,}, S3={len(emb_s3):,}, dim={dim}")
+
+    # Build combined S2+S3 embeddings via memmap file
+    emb_s2s3_path = cache / "_emb_train_s2s3.npy"
+    if not emb_s2s3_path.exists():
+        logger.info(f"Building combined S2+S3 embedding file ({n_s2s3:,} x {dim}) ...")
+        fp = np.lib.format.open_memmap(
+            str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
+        )
+        fp[:len(emb_s2)] = emb_s2[:]
+        fp[len(emb_s2):] = emb_s3[:]
+        fp.flush()
+        del fp
     del emb_s2, emb_s3
     free_memory()
+    emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
 
     s1_ids = pp_train_s1.index.values
     cand_ids = pp_train_s2s3.index.values
@@ -393,13 +458,26 @@ def run_inference_phase(pp_test_s1, pp_test_s2, pp_test_s3,
     # Load token IDF
     token_idf = pd.read_parquet(cache / "token_idf.parquet")["idf"].to_dict()
 
-    # Load embeddings
-    emb_s1 = np.load(cache / "emb_test_s1.npy")
-    emb_s2 = np.load(cache / "emb_test_s2.npy")
-    emb_s3 = np.load(cache / "emb_test_s3.npy")
-    emb_s2s3 = np.vstack([emb_s2, emb_s3])
+    # Load embeddings using memory-mapping
+    emb_s1 = np.load(cache / "emb_test_s1.npy", mmap_mode="r")
+    emb_s2 = np.load(cache / "emb_test_s2.npy", mmap_mode="r")
+    emb_s3 = np.load(cache / "emb_test_s3.npy", mmap_mode="r")
+    n_s2s3 = len(emb_s2) + len(emb_s3)
+    dim = emb_s1.shape[1]
+
+    emb_s2s3_path = cache / "_emb_test_s2s3.npy"
+    if not emb_s2s3_path.exists():
+        logger.info(f"Building combined test S2+S3 embedding ({n_s2s3:,} x {dim}) ...")
+        fp = np.lib.format.open_memmap(
+            str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
+        )
+        fp[:len(emb_s2)] = emb_s2[:]
+        fp[len(emb_s2):] = emb_s3[:]
+        fp.flush()
+        del fp
     del emb_s2, emb_s3
     free_memory()
+    emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
 
     s1_ids = pp_test_s1.index.values
     cand_ids = pp_test_s2s3.index.values

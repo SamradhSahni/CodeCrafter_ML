@@ -35,10 +35,10 @@ def load_embedding_model(model_name: str = None) -> SentenceTransformer:
 # ──────────────────────────────────────────────
 @timed
 def encode_texts(model: SentenceTransformer, texts, batch_size: int = None,
-                 desc: str = "Encoding") -> np.ndarray:
+                 desc: str = "Encoding", chunk_size: int = 500_000) -> np.ndarray:
     """
     Encode texts to L2-normalized dense vectors.
-    Uses GPU if available, with batched processing.
+    Processes in sub-chunks to avoid OOM on large datasets (5M+ texts).
     """
     batch_size = batch_size or config.EMBEDDING_BATCH_SIZE
 
@@ -49,19 +49,65 @@ def encode_texts(model: SentenceTransformer, texts, batch_size: int = None,
     # Replace empty strings with a space (model needs non-empty input)
     texts = [t if t and str(t).strip() else " " for t in texts]
 
-    logger.info(f"Encoding {len(texts):,} texts (batch_size={batch_size}, "
+    n = len(texts)
+    logger.info(f"Encoding {n:,} texts (batch_size={batch_size}, "
                 f"device={model.device}) ...")
 
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=True,    # L2-normalize for cosine sim = dot product
-        convert_to_numpy=True,
-    )
+    if n <= chunk_size:
+        # Small enough to encode in one shot
+        embeddings = model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        logger.info(f"  -> Embeddings shape: {embeddings.shape}, dtype: {embeddings.dtype}")
+        return embeddings.astype(np.float32)
 
-    logger.info(f"  -> Embeddings shape: {embeddings.shape}, dtype: {embeddings.dtype}")
-    return embeddings.astype(np.float32)
+    # Large dataset: encode in sub-chunks and concatenate on disk
+    import tempfile, os
+    chunk_files = []
+    dim = None
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk_texts = texts[start:end]
+        logger.info(f"  Encoding chunk {start:,}-{end:,} ({len(chunk_texts):,} texts) ...")
+
+        chunk_emb = model.encode(
+            chunk_texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).astype(np.float32)
+
+        if dim is None:
+            dim = chunk_emb.shape[1]
+
+        # Save chunk to temp file
+        tmp_path = config.CACHE_DIR / f"_emb_chunk_{start}.npy"
+        np.save(tmp_path, chunk_emb)
+        chunk_files.append(tmp_path)
+        del chunk_emb, chunk_texts
+        gc.collect()
+        if config.HAS_CUDA:
+            torch.cuda.empty_cache()
+
+    # Concatenate from disk using memory-mapped reads
+    logger.info(f"  Merging {len(chunk_files)} embedding chunks ...")
+    all_emb = np.empty((n, dim), dtype=np.float32)
+    offset = 0
+    for cf in chunk_files:
+        chunk = np.load(cf)
+        all_emb[offset:offset + len(chunk)] = chunk
+        offset += len(chunk)
+        del chunk
+        cf.unlink()  # cleanup temp file
+
+    logger.info(f"  -> Embeddings shape: {all_emb.shape}, dtype: {all_emb.dtype}")
+    return all_emb
 
 
 # ──────────────────────────────────────────────
