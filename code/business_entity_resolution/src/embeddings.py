@@ -118,7 +118,8 @@ def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None,
                       add_batch_size: int = 500_000) -> faiss.Index:
     """
     Build a FAISS index for fast inner-product (cosine) similarity search.
-    Memory-safe: trains IVF on a subsample, adds vectors in batches.
+    Uses IVF-PQ for very large datasets (>2M) to compress stored vectors,
+    IVFFlat for medium datasets, and flat for small datasets.
     """
     if use_gpu is None:
         use_gpu = config.HAS_CUDA
@@ -126,40 +127,68 @@ def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None,
     dim = vectors.shape[1]
     n = vectors.shape[0]
 
-    if n > 500_000:
-        # IVF index for large datasets
-        nlist = min(int(np.sqrt(n)), 4096)
-        quantizer = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-        logger.info(f"Building IVF index: {n:,} vectors, dim={dim}, nlist={nlist}")
-
-        # Train on a random subsample to avoid loading all into RAM
-        train_size = min(500_000, n)
+    # Train subsample (shared by IVFFlat and IVFPQ)
+    def _get_train_vectors(max_train=500_000):
+        train_size = min(max_train, n)
         rng = np.random.default_rng(42)
-        train_indices = rng.choice(n, size=train_size, replace=False)
-        train_indices.sort()  # sequential access for mmap efficiency
-        train_vectors = np.ascontiguousarray(
-            vectors[train_indices].astype(np.float32)
-        )
+        idx = rng.choice(n, size=train_size, replace=False)
+        idx.sort()
+        tv = np.ascontiguousarray(vectors[idx].astype(np.float32))
         logger.info(f"  Training on {train_size:,} subsample ...")
+        return tv
+
+    if n > 2_000_000:
+        # IVF-PQ for very large datasets — compressed storage
+        # Each 384-dim vector stored as 48 bytes instead of 1536 bytes
+        # 10M vectors: ~480MB instead of ~15GB
+        nlist = min(int(np.sqrt(n)), 4096)
+        m = 48  # number of sub-quantizers (dim must be divisible by m)
+        nbits = 8  # bits per sub-quantizer
+        quantizer = faiss.IndexFlatIP(dim)
+        index = faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits,
+                                 faiss.METRIC_INNER_PRODUCT)
+        logger.info(f"Building IVF-PQ index: {n:,} vectors, dim={dim}, "
+                    f"nlist={nlist}, m={m}, nbits={nbits}")
+
+        train_vectors = _get_train_vectors()
         index.train(train_vectors)
         del train_vectors
         gc.collect()
 
-        # Add vectors in batches to avoid full-array copy
+        # Add vectors in batches
         logger.info(f"  Adding {n:,} vectors in batches of {add_batch_size:,} ...")
         for start in range(0, n, add_batch_size):
             end = min(start + add_batch_size, n)
-            batch = np.ascontiguousarray(
-                vectors[start:end].astype(np.float32)
-            )
+            batch = np.ascontiguousarray(vectors[start:end].astype(np.float32))
             index.add(batch)
             del batch
         gc.collect()
-
         index.nprobe = config.FAISS_NPROBE
+        logger.info(f"  Index built: ~{index.ntotal * m / 1e6:.0f} MB compressed storage")
+
+    elif n > 500_000:
+        # IVFFlat for medium datasets — exact stored vectors
+        nlist = min(int(np.sqrt(n)), 4096)
+        quantizer = faiss.IndexFlatIP(dim)
+        index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+        logger.info(f"Building IVF-Flat index: {n:,} vectors, dim={dim}, nlist={nlist}")
+
+        train_vectors = _get_train_vectors()
+        index.train(train_vectors)
+        del train_vectors
+        gc.collect()
+
+        logger.info(f"  Adding {n:,} vectors in batches of {add_batch_size:,} ...")
+        for start in range(0, n, add_batch_size):
+            end = min(start + add_batch_size, n)
+            batch = np.ascontiguousarray(vectors[start:end].astype(np.float32))
+            index.add(batch)
+            del batch
+        gc.collect()
+        index.nprobe = config.FAISS_NPROBE
+
     else:
-        # Flat index for smaller datasets — exact search
+        # Flat index for small datasets — exact search
         vecs = np.ascontiguousarray(vectors[:].astype(np.float32))
         index = faiss.IndexFlatIP(dim)
         index.add(vecs)
