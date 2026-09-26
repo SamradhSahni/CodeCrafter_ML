@@ -255,8 +255,15 @@ def compute_pair_features(s1_rec: dict, cand_rec: dict,
     # ── 3.9 Embedding features (7) ──
     emb_prov = embedding_provenance or {}
     emb_recip = embedding_reciprocal or {}
-    feats["embedding_cosine_sim"] = emb_prov.get("embedding_score", 0.0)
-    feats["embedding_rank"] = emb_prov.get("embedding_rank", 999)
+    if isinstance(emb_prov, (tuple, list)):
+        feats["embedding_cosine_sim"] = float(emb_prov[1])
+        feats["embedding_rank"] = int(emb_prov[0])
+    elif isinstance(emb_prov, dict):
+        feats["embedding_cosine_sim"] = float(emb_prov.get("embedding_score", 0.0))
+        feats["embedding_rank"] = int(emb_prov.get("embedding_rank", 999))
+    else:
+        feats["embedding_cosine_sim"] = 0.0
+        feats["embedding_rank"] = 999
     feats["emb_fwd_rank"] = emb_recip.get("emb_fwd_rank", 999)
     feats["emb_rev_rank"] = emb_recip.get("emb_rev_rank", -1)
     feats["emb_mutual_top1"] = 1.0 if emb_recip.get("emb_mutual_top1", False) else 0.0

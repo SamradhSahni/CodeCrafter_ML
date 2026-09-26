@@ -128,7 +128,7 @@ def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None,
     n = vectors.shape[0]
 
     # Train subsample (shared by IVFFlat and IVFPQ)
-    def _get_train_vectors(max_train=500_000):
+    def _get_train_vectors(max_train=50_000):
         train_size = min(max_train, n)
         rng = np.random.default_rng(42)
         idx = rng.choice(n, size=train_size, replace=False)
@@ -267,15 +267,12 @@ def run_embedding_blocking(s1_ids: np.ndarray, cand_ids: np.ndarray,
             if j < 0 or j >= len(cand_ids):
                 continue
             score = float(distances[i, rank])
-            # Keep top-3 unconditionally; for rank >= 3, keep only if score >= min_sim
-            if rank >= 3 and score < min_sim:
+            # Keep top-1 unconditionally; for rank >= 1, keep only if score >= min_sim
+            if rank >= 1 and score < min_sim:
                 continue
             cand_id = cand_ids[j]
             candidates[s1_id].add(cand_id)
-            provenance[(s1_id, cand_id)] = {
-                "embedding_rank": rank,
-                "embedding_score": round(score, 4),
-            }
+            provenance[(s1_id, cand_id)] = (rank, round(score, 4))
 
     del distances, indices
     gc.collect()
@@ -352,7 +349,7 @@ def run_embedding_reciprocal(s1_ids: np.ndarray, cand_ids: np.ndarray,
     # Join forward + reverse
     reciprocal = {}
     for (s1_id, cand_id), prov in forward_provenance.items():
-        fwd_rank = prov.get("embedding_rank", 999)
+        fwd_rank = prov[0] if isinstance(prov, (tuple, list)) else prov.get("embedding_rank", 999)
         rev_rank_map = reverse_ranks.get(cand_id, {})
         rev_rank = rev_rank_map.get(s1_id, -1)
 
