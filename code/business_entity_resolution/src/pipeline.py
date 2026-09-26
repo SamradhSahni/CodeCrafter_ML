@@ -180,39 +180,41 @@ def run_embedding_phase():
 #  Phase 3: Blocking (FAISS + TF-IDF hybrid)
 # ──────────────────────────────────────────────
 @timed
-def run_blocking_phase(pp_train_s1, pp_train_s2, pp_train_s3, ground_truth):
-    """Run hybrid blocking: FAISS dense + TF-IDF sparse + inverted index strategies."""
-    logger.info("=" * 60)
-    logger.info("PHASE 3: BLOCKING (FAISS + TF-IDF HYBRID)")
-    logger.info("=" * 60)
-
-    pp_train_s2s3 = pd.concat([pp_train_s2, pp_train_s3])
-    logger.info(f"Combined S2+S3: {len(pp_train_s2s3):,} records")
-
-    # Country gate
-    cross_rate = verify_country_gate(ground_truth, pp_train_s1, pp_train_s2s3)
-    if cross_rate > 0:
-        logger.warning(f"Cross-country rate = {cross_rate:.4%}")
-
-    # Build token IDF
-    all_names = pd.concat([pp_train_s1["name_core"], pp_train_s2s3["name_core"]])
-    token_idf = block.build_token_idf(all_names)
-    pd.Series(token_idf).to_frame("idf").to_parquet(config.CACHE_DIR / "token_idf.parquet")
-    logger.info(f"Token IDF: {len(token_idf):,} tokens")
-
-    # Load embeddings using memory-mapping to avoid OOM
+def run_faiss_blocking():
+    """Run FAISS embedding blocking with minimal memory footprint.
+    Only loads entity IDs and embeddings — no full DataFrames.
+    Saves results to cache for later use.
+    """
     cache = config.CACHE_DIR
+    faiss_cache = cache / "faiss_blocking.pkl"
+    if faiss_cache.exists():
+        logger.info("FAISS blocking cached, loading ...")
+        import pickle
+        with open(faiss_cache, "rb") as f:
+            return pickle.load(f)
+
+    logger.info("\n--- FAISS Embedding Blocking ---")
+
+    # Load only entity IDs from parquet (not full DataFrames!)
+    s1_ids = pd.read_parquet(cache / "pp_train_s1.parquet", columns=[]).index.values
+    s2_ids = pd.read_parquet(cache / "pp_train_s2.parquet", columns=[]).index.values
+    s3_ids = pd.read_parquet(cache / "pp_train_s3.parquet", columns=[]).index.values
+    cand_ids = np.concatenate([s2_ids, s3_ids])
+    del s2_ids, s3_ids
+
+    logger.info(f"S1: {len(s1_ids):,}, Candidates: {len(cand_ids):,}")
+
+    # Load embeddings via memory-mapping
     emb_s1 = np.load(cache / "emb_train_s1.npy", mmap_mode="r")
     emb_s2 = np.load(cache / "emb_train_s2.npy", mmap_mode="r")
     emb_s3 = np.load(cache / "emb_train_s3.npy", mmap_mode="r")
     n_s2s3 = len(emb_s2) + len(emb_s3)
     dim = emb_s1.shape[1]
-    logger.info(f"Embeddings: S1={len(emb_s1):,}, S2={len(emb_s2):,}, S3={len(emb_s3):,}, dim={dim}")
 
     # Build combined S2+S3 embeddings via memmap file
     emb_s2s3_path = cache / "_emb_train_s2s3.npy"
     if not emb_s2s3_path.exists():
-        logger.info(f"Building combined S2+S3 embedding file ({n_s2s3:,} x {dim}) ...")
+        logger.info(f"Building combined S2+S3 embedding ({n_s2s3:,} x {dim}) ...")
         fp = np.lib.format.open_memmap(
             str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
         )
@@ -224,22 +226,47 @@ def run_blocking_phase(pp_train_s1, pp_train_s2, pp_train_s3, ground_truth):
     free_memory()
     emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
 
-    s1_ids = pp_train_s1.index.values
-    cand_ids = pp_train_s2s3.index.values
-
-    # ── Strategy 0: FAISS dense embedding blocking (global) ──
-    logger.info("\n--- FAISS Embedding Blocking (global) ---")
+    # FAISS blocking
     emb_candidates, emb_provenance = emb.run_embedding_blocking(
         s1_ids, cand_ids, emb_s1, emb_s2s3, topk=config.FAISS_TOP_K
     )
 
-    # Embedding reciprocal retrieval
+    # Reciprocal retrieval
     emb_reciprocal = emb.run_embedding_reciprocal(
         s1_ids, cand_ids, emb_s1, emb_s2s3, emb_provenance, topk=20
     )
 
     del emb_s1, emb_s2s3
     free_memory()
+
+    # Cache FAISS results to disk
+    import pickle
+    result = (emb_candidates, emb_provenance, emb_reciprocal)
+    with open(faiss_cache, "wb") as f:
+        pickle.dump(result, f)
+    logger.info(f"FAISS blocking saved: {len(emb_candidates):,} S1 entities with candidates")
+
+    return result
+
+
+@timed
+def run_blocking_phase(pp_train_s1, pp_train_s2s3, ground_truth,
+                       emb_candidates, emb_provenance, emb_reciprocal):
+    """Run TF-IDF + inverted index blocking, merging with pre-computed FAISS results."""
+    logger.info("=" * 60)
+    logger.info("PHASE 3: BLOCKING (TF-IDF + INVERTED INDEX)")
+    logger.info("=" * 60)
+
+    # Country gate
+    cross_rate = verify_country_gate(ground_truth, pp_train_s1, pp_train_s2s3)
+    if cross_rate > 0:
+        logger.warning(f"Cross-country rate = {cross_rate:.4%}")
+
+    # Build token IDF
+    all_names = pd.concat([pp_train_s1["name_core"], pp_train_s2s3["name_core"]])
+    token_idf = block.build_token_idf(all_names)
+    pd.Series(token_idf).to_frame("idf").to_parquet(config.CACHE_DIR / "token_idf.parquet")
+    logger.info(f"Token IDF: {len(token_idf):,} tokens")
 
     # ── TF-IDF + inverted index blocking (per country) ──
     all_candidates = defaultdict(set)
@@ -589,25 +616,44 @@ def run_full_pipeline(nrows=None):
     run_embedding_phase()
     free_memory()
 
-    # Load train data
-    logger.info("Loading train preprocessed data ...")
-    pp_train_s1 = pd.read_parquet(config.CACHE_DIR / "pp_train_s1.parquet")
-    pp_train_s2 = pd.read_parquet(config.CACHE_DIR / "pp_train_s2.parquet")
-    pp_train_s3 = pd.read_parquet(config.CACHE_DIR / "pp_train_s3.parquet")
-
-    s1_filter = list(pp_train_s1.index) if nrows else None
-    ground_truth = load_ground_truth(config.TRAIN_GT, s1_ids_filter=s1_filter)
-
-    # Phase 3: Blocking
-    (candidates, provenance, reciprocal,
-     emb_provenance, emb_reciprocal, token_idf) = run_blocking_phase(
-        pp_train_s1, pp_train_s2, pp_train_s3, ground_truth
-    )
+    # Phase 3a: FAISS blocking (minimal memory - no DataFrames loaded)
+    emb_candidates, emb_provenance, emb_reciprocal = run_faiss_blocking()
     free_memory()
 
-    # Phase 4: Features
-    pp_train_s2s3 = pd.concat([pp_train_s2, pp_train_s3])
-    del pp_train_s2, pp_train_s3
+    # Now load train data for TF-IDF blocking + features
+    logger.info("Loading train preprocessed data ...")
+    # Load only blocking-relevant columns first
+    blocking_cols = ["name_core", "name_clean", "addr_clean", "country",
+                     "phonetic_key", "postal_code", "city"]
+    pp_train_s1_block = pd.read_parquet(config.CACHE_DIR / "pp_train_s1.parquet",
+                                         columns=blocking_cols)
+    pp_train_s2_block = pd.read_parquet(config.CACHE_DIR / "pp_train_s2.parquet",
+                                         columns=blocking_cols)
+    pp_train_s3_block = pd.read_parquet(config.CACHE_DIR / "pp_train_s3.parquet",
+                                         columns=blocking_cols)
+    pp_train_s2s3_block = pd.concat([pp_train_s2_block, pp_train_s3_block])
+    del pp_train_s2_block, pp_train_s3_block
+    free_memory()
+
+    s1_filter = list(pp_train_s1_block.index) if nrows else None
+    ground_truth = load_ground_truth(config.TRAIN_GT, s1_ids_filter=s1_filter)
+
+    # Phase 3b: TF-IDF + inverted index blocking (uses only blocking columns)
+    (candidates, provenance, reciprocal,
+     _emb_prov, _emb_recip, token_idf) = run_blocking_phase(
+        pp_train_s1_block, pp_train_s2s3_block, ground_truth,
+        emb_candidates, emb_provenance, emb_reciprocal
+    )
+    del pp_train_s1_block, pp_train_s2s3_block
+    free_memory()
+
+    # Phase 4: Features (load full DataFrames)
+    logger.info("Loading full train data for feature computation ...")
+    pp_train_s1 = pd.read_parquet(config.CACHE_DIR / "pp_train_s1.parquet")
+    pp_train_s2s3 = pd.concat([
+        pd.read_parquet(config.CACHE_DIR / "pp_train_s2.parquet"),
+        pd.read_parquet(config.CACHE_DIR / "pp_train_s3.parquet"),
+    ])
     free_memory()
 
     feature_df = run_features_phase(
