@@ -367,22 +367,29 @@ def _process_chunk(chunk_df):
 
 @timed
 def preprocess_dataframe(df: pd.DataFrame, source_label: str,
-                         chunk_size: int = 50000) -> pd.DataFrame:
+                         flush_every: int = 500_000) -> pd.DataFrame:
     """
-    Preprocess an entire source DataFrame.
+    Preprocess an entire source DataFrame with chunked parquet saving.
 
-    Uses streaming approach: process rows sequentially with tqdm,
-    flush to list periodically. Memory-safe for 16GB RAM machines.
+    Writes intermediate chunks to disk every `flush_every` rows to avoid
+    holding all records in memory (critical for 16GB RAM + 5M row sources).
 
     Args:
         df: Raw DataFrame with entity_id, business_name, business_address, country
         source_label: Label for logging (e.g. "train_S1")
-        chunk_size: Rows to accumulate before logging progress
+        flush_every: Rows before flushing chunk to disk
     """
-    logger.info(f"Preprocessing {source_label}: {len(df):,} records ...")
+    import gc
+    from . import config
 
+    logger.info(f"Preprocessing {source_label}: {len(df):,} records ...")
     n = len(df)
+
+    chunk_dir = config.CACHE_DIR / f"_chunks_{source_label}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_paths = []
     records = []
+    chunk_idx = 0
 
     for _, row in tqdm(df.iterrows(), total=n, desc=f"Preprocess {source_label}"):
         eid = row["entity_id"]
@@ -394,8 +401,35 @@ def preprocess_dataframe(df: pd.DataFrame, source_label: str,
         rec["entity_id"] = eid
         records.append(rec)
 
-    result = pd.DataFrame(records)
-    result = result.set_index("entity_id")
+        if len(records) >= flush_every:
+            chunk_df = pd.DataFrame(records).set_index("entity_id")
+            chunk_path = chunk_dir / f"chunk_{chunk_idx:04d}.parquet"
+            chunk_df.to_parquet(chunk_path)
+            chunk_paths.append(chunk_path)
+            logger.info(f"  Flushed chunk {chunk_idx} ({len(chunk_df):,} rows)")
+            del chunk_df, records
+            gc.collect()
+            records = []
+            chunk_idx += 1
+
+    # Flush remaining
+    if records:
+        chunk_df = pd.DataFrame(records).set_index("entity_id")
+        chunk_path = chunk_dir / f"chunk_{chunk_idx:04d}.parquet"
+        chunk_df.to_parquet(chunk_path)
+        chunk_paths.append(chunk_path)
+        del chunk_df, records
+        gc.collect()
+
+    # Read back and concatenate
+    logger.info(f"  Merging {len(chunk_paths)} chunks ...")
+    result = pd.concat([pd.read_parquet(p) for p in chunk_paths])
+
+    # Cleanup chunk files
+    for p in chunk_paths:
+        p.unlink()
+    chunk_dir.rmdir()
+
     logger.info(f"  -> {source_label} preprocessed: {len(result):,} records, "
                 f"{len(result.columns)} columns")
     return result

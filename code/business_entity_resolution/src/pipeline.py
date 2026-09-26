@@ -64,8 +64,11 @@ def run_preprocess(nrows=None):
             continue
         raw = load_source(path, nrows=nrows)
         pp = prep.preprocess_dataframe(raw, label)
+        del raw
+        free_memory()
         pp.to_parquet(out_path)
-        del raw, pp
+        logger.info(f"  Saved {out_path.name} ({len(pp):,} rows)")
+        del pp
         free_memory()
 
     logger.info(f"All preprocessed data saved to {cache}")
