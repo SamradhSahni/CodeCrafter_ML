@@ -114,10 +114,11 @@ def encode_texts(model: SentenceTransformer, texts, batch_size: int = None,
 #  FAISS Index
 # ──────────────────────────────────────────────
 @timed
-def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None) -> faiss.Index:
+def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None,
+                      add_batch_size: int = 500_000) -> faiss.Index:
     """
     Build a FAISS index for fast inner-product (cosine) similarity search.
-    Uses IVF for datasets > 1M, flat index otherwise.
+    Memory-safe: trains IVF on a subsample, adds vectors in batches.
     """
     if use_gpu is None:
         use_gpu = config.HAS_CUDA
@@ -125,22 +126,44 @@ def build_faiss_index(vectors: np.ndarray, use_gpu: bool = None) -> faiss.Index:
     dim = vectors.shape[1]
     n = vectors.shape[0]
 
-    # Ensure C-contiguous float32
-    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-
     if n > 500_000:
-        # IVF index for large datasets — approximate but much faster
+        # IVF index for large datasets
         nlist = min(int(np.sqrt(n)), 4096)
         quantizer = faiss.IndexFlatIP(dim)
         index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
         logger.info(f"Building IVF index: {n:,} vectors, dim={dim}, nlist={nlist}")
-        index.train(vectors)
-        index.add(vectors)
+
+        # Train on a random subsample to avoid loading all into RAM
+        train_size = min(500_000, n)
+        rng = np.random.default_rng(42)
+        train_indices = rng.choice(n, size=train_size, replace=False)
+        train_indices.sort()  # sequential access for mmap efficiency
+        train_vectors = np.ascontiguousarray(
+            vectors[train_indices].astype(np.float32)
+        )
+        logger.info(f"  Training on {train_size:,} subsample ...")
+        index.train(train_vectors)
+        del train_vectors
+        gc.collect()
+
+        # Add vectors in batches to avoid full-array copy
+        logger.info(f"  Adding {n:,} vectors in batches of {add_batch_size:,} ...")
+        for start in range(0, n, add_batch_size):
+            end = min(start + add_batch_size, n)
+            batch = np.ascontiguousarray(
+                vectors[start:end].astype(np.float32)
+            )
+            index.add(batch)
+            del batch
+        gc.collect()
+
         index.nprobe = config.FAISS_NPROBE
     else:
         # Flat index for smaller datasets — exact search
+        vecs = np.ascontiguousarray(vectors[:].astype(np.float32))
         index = faiss.IndexFlatIP(dim)
-        index.add(vectors)
+        index.add(vecs)
+        del vecs
         logger.info(f"Building flat index: {n:,} vectors, dim={dim}")
 
     # Move to GPU if available
@@ -161,21 +184,23 @@ def search_faiss(query_vectors: np.ndarray, index: faiss.Index,
     """
     Batch-search FAISS index for top-K neighbors.
     Returns (distances, indices) arrays of shape (n_queries, k).
+    Memory-safe: copies only one batch at a time to contiguous array.
     """
     n = query_vectors.shape[0]
-    query_vectors = np.ascontiguousarray(query_vectors, dtype=np.float32)
-
     logger.info(f"FAISS search: {n:,} queries, top-{k} ...")
 
     all_distances = np.zeros((n, k), dtype=np.float32)
-    all_indices = np.zeros((n, k), dtype=np.int64)
+    all_indices = np.full((n, k), -1, dtype=np.int64)
 
     for start in tqdm(range(0, n, batch_size), desc="FAISS search"):
         end = min(start + batch_size, n)
-        batch = query_vectors[start:end]
+        batch = np.ascontiguousarray(
+            query_vectors[start:end].astype(np.float32)
+        )
         distances, indices = index.search(batch, k)
         all_distances[start:end] = distances
         all_indices[start:end] = indices
+        del batch
 
     logger.info(f"  -> Search complete: {n * k:,} results")
     return all_distances, all_indices
