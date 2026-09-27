@@ -117,15 +117,17 @@ class TFIDFBlocker:
         return sp.vstack(chunks, format="csr")
 
     def retrieve_topk(self, query_vecs: csr_matrix, corpus_vecs: csr_matrix,
-                      topk: int, min_sim: float = 0.3, n_jobs: int = 4,
+                      topk: int, min_sim: float = 0.3, n_jobs: int = None,
                       batch_size: int = 200_000):
         """
         Retrieve top-K candidates for each query from corpus in memory-safe batches.
         Returns sparse matrix (n_queries x n_corpus) with similarities.
         """
+        if n_jobs is None:
+            n_jobs = getattr(config, "N_JOBS", 4)
         n_queries = query_vecs.shape[0]
         logger.info(f"TF-IDF retrieval ({self.field}): {n_queries:,} queries x "
-                     f"{corpus_vecs.shape[0]:,} corpus, top-{topk} ...")
+                     f"{corpus_vecs.shape[0]:,} corpus, top-{topk} (threads={n_jobs}) ...")
         
         if n_queries <= batch_size:
             try:
@@ -145,7 +147,7 @@ class TFIDFBlocker:
         # Batch query matrix to keep memory minimal
         results = []
         corpus_T = corpus_vecs.T.tocsc()
-        for start in range(0, n_queries, batch_size):
+        for start in tqdm(range(0, n_queries, batch_size), desc=f"TF-IDF {self.field} batches"):
             end = min(start + batch_size, n_queries)
             sub_query = query_vecs[start:end]
             try:
@@ -254,8 +256,8 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
     # ── Strategy 1: TF-IDF name blocking ──
     logger.info(f"  Strategy 1: TF-IDF Name blocking ...")
     name_blocker = TFIDFBlocker(
-        "name", analyzer="char_wb",
-        ngram_range=config.TFIDF_NAME_NGRAM_RANGE,
+        "name", analyzer="word",
+        ngram_range=(1, 2),
         max_features=config.TFIDF_NAME_MAX_FEATURES,
     )
     all_names = pd.concat([s1_df["name_clean"], s2s3_df["name_clean"]])
@@ -515,12 +517,12 @@ def run_reciprocal_retrieval(s1_name_vecs, s2s3_name_vecs, s1_ids, cand_ids,
     logger.info(f"Running reciprocal retrieval: {len(unique_cand_ids):,} unique S2S3 -> "
                 f"{s1_name_vecs.shape[0]:,} S1, top-{topk} ...")
 
-    # Independent reverse: unique S2S3 queries against S1 corpus
+    n_jobs = getattr(config, "N_JOBS", 4)
     try:
         reverse_sim = awesome_cossim_topn(
             sub_s2s3_vecs, s1_name_vecs.T,
             ntop=topk, lower_bound=config.TFIDF_MIN_SIMILARITY,
-            use_threads=True, n_jobs=4,
+            use_threads=True, n_jobs=n_jobs,
         )
     except TypeError:
         reverse_sim = awesome_cossim_topn(
