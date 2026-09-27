@@ -71,6 +71,7 @@ if IS_HIGH_COMPUTE:
     BLOCKING_MAX_CANDS_PER_ENTITY = 60
     INVERTED_INDEX_MAX_BUCKET = 300
     TFIDF_NAME_MAX_FEATURES = 200_000
+    TFIDF_ADDR_MAX_FEATURES = 100_000
     N_JOBS = CPU_COUNT
 else:
     # Local laptop / constrained hardware mode
@@ -81,6 +82,7 @@ else:
     BLOCKING_MAX_CANDS_PER_ENTITY = 50
     INVERTED_INDEX_MAX_BUCKET = 200
     TFIDF_NAME_MAX_FEATURES = 100_000
+    TFIDF_ADDR_MAX_FEATURES = 50_000
     N_JOBS = max(1, CPU_COUNT - 1)
 
 # ──────────────────────────────────────────────
@@ -138,8 +140,6 @@ US_STATE_ABBREV = {
 #  TF-IDF Blocking (secondary retrieval)
 # ──────────────────────────────────────────────
 TFIDF_NAME_NGRAM_RANGE = (3, 4)
-TFIDF_NAME_MAX_FEATURES = 100_000
-TFIDF_ADDR_MAX_FEATURES = 50_000
 TFIDF_MAX_FIT_SAMPLES = 500_000
 TFIDF_MIN_SIMILARITY = 0.3
 TFIDF_REVERSE_TOPK = 20
