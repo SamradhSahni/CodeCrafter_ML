@@ -723,7 +723,9 @@ def main():
         gt = load_ground_truth(config.TRAIN_GT)
 
         if args.phase == "blocking":
-            run_blocking_phase(pp_s1, pp_s2, pp_s3, gt)
+            emb_cands, emb_prov, emb_recip = run_faiss_blocking()
+            s2s3 = pd.concat([pp_s2, pp_s3])
+            run_blocking_phase(pp_s1, s2s3, gt, emb_cands, emb_prov, emb_recip)
         elif args.phase == "features":
             cdf = pd.read_parquet(config.CACHE_DIR / "blocking_candidates.parquet")
             cands = defaultdict(set)
