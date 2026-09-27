@@ -259,6 +259,72 @@ def run_faiss_blocking():
     return result
 
 
+def run_faiss_test_blocking():
+    """Run FAISS vector blocking on test data with checkpointing and disk caching."""
+    cache = config.CACHE_DIR
+    faiss_cache = cache / "faiss_test_blocking.pkl"
+    if faiss_cache.exists():
+        logger.info(f"Loading cached test FAISS results from {faiss_cache} ...")
+        with open(faiss_cache, "rb") as f:
+            return pickle.load(f)
+
+    logger.info("\n--- FAISS Test Embedding Blocking ---")
+    s1_ids = pd.read_parquet(cache / "pp_test_s1.parquet", columns=[]).index.values
+    s2_ids = pd.read_parquet(cache / "pp_test_s2.parquet", columns=[]).index.values
+    s3_ids = pd.read_parquet(cache / "pp_test_s3.parquet", columns=[]).index.values
+    cand_ids = np.concatenate([s2_ids, s3_ids])
+    del s2_ids, s3_ids
+
+    logger.info(f"Test S1: {len(s1_ids):,}, Candidates: {len(cand_ids):,}")
+
+    emb_s1 = np.load(cache / "emb_test_s1.npy", mmap_mode="r")
+    emb_s2 = np.load(cache / "emb_test_s2.npy", mmap_mode="r")
+    emb_s3 = np.load(cache / "emb_test_s3.npy", mmap_mode="r")
+    n_s2s3 = len(emb_s2) + len(emb_s3)
+    dim = emb_s1.shape[1]
+
+    emb_s2s3_path = cache / "_emb_test_s2s3.npy"
+    if not emb_s2s3_path.exists():
+        logger.info(f"Building combined test S2+S3 embedding ({n_s2s3:,} x {dim}) ...")
+        fp = np.lib.format.open_memmap(
+            str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
+        )
+        fp[:len(emb_s2)] = emb_s2[:]
+        fp[len(emb_s2):] = emb_s3[:]
+        fp.flush()
+        del fp
+    del emb_s2, emb_s3
+    free_memory()
+    emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
+
+    faiss_fwd_cache = cache / "faiss_test_forward.pkl"
+    if faiss_fwd_cache.exists():
+        logger.info(f"Loading cached forward test FAISS results from {faiss_fwd_cache} ...")
+        with open(faiss_fwd_cache, "rb") as f:
+            emb_candidates, emb_provenance = pickle.load(f)
+        logger.info(f"Loaded {len(emb_candidates):,} test forward candidates")
+    else:
+        emb_candidates, emb_provenance = emb.run_embedding_blocking(
+            s1_ids, cand_ids, emb_s1, emb_s2s3, topk=config.FAISS_TOP_K
+        )
+        with open(faiss_fwd_cache, "wb") as f:
+            pickle.dump((emb_candidates, emb_provenance), f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"Test forward FAISS checkpoint saved to {faiss_fwd_cache}")
+
+    emb_reciprocal = emb.run_embedding_reciprocal(
+        s1_ids, cand_ids, emb_s1, emb_s2s3, emb_provenance, topk=20
+    )
+    del emb_s1, emb_s2s3
+    free_memory()
+
+    result = (emb_candidates, emb_provenance, emb_reciprocal)
+    with open(faiss_cache, "wb") as f:
+        pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info(f"Test FAISS blocking saved: {len(emb_candidates):,} S1 entities")
+
+    return result
+
+
 @timed
 def run_blocking_phase(pp_train_s1, pp_train_s2s3, ground_truth,
                        emb_candidates, emb_provenance, emb_reciprocal):
@@ -534,39 +600,46 @@ def run_inference_phase(pp_test_s1, pp_test_s2, pp_test_s3,
     # Load token IDF
     token_idf = pd.read_parquet(cache / "token_idf.parquet")["idf"].to_dict()
 
-    # Load embeddings using memory-mapping
-    emb_s1 = np.load(cache / "emb_test_s1.npy", mmap_mode="r")
-    emb_s2 = np.load(cache / "emb_test_s2.npy", mmap_mode="r")
-    emb_s3 = np.load(cache / "emb_test_s3.npy", mmap_mode="r")
-    n_s2s3 = len(emb_s2) + len(emb_s3)
-    dim = emb_s1.shape[1]
+    faiss_test_cache = cache / "faiss_test_blocking.pkl"
+    if faiss_test_cache.exists():
+        logger.info(f"Loading cached test FAISS results from {faiss_test_cache} ...")
+        with open(faiss_test_cache, "rb") as f:
+            emb_candidates, emb_provenance, emb_reciprocal = pickle.load(f)
+        logger.info(f"Loaded {len(emb_candidates):,} test entities with FAISS candidates")
+    else:
+        # Load embeddings using memory-mapping
+        emb_s1 = np.load(cache / "emb_test_s1.npy", mmap_mode="r")
+        emb_s2 = np.load(cache / "emb_test_s2.npy", mmap_mode="r")
+        emb_s3 = np.load(cache / "emb_test_s3.npy", mmap_mode="r")
+        n_s2s3 = len(emb_s2) + len(emb_s3)
+        dim = emb_s1.shape[1]
 
-    emb_s2s3_path = cache / "_emb_test_s2s3.npy"
-    if not emb_s2s3_path.exists():
-        logger.info(f"Building combined test S2+S3 embedding ({n_s2s3:,} x {dim}) ...")
-        fp = np.lib.format.open_memmap(
-            str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
+        emb_s2s3_path = cache / "_emb_test_s2s3.npy"
+        if not emb_s2s3_path.exists():
+            logger.info(f"Building combined test S2+S3 embedding ({n_s2s3:,} x {dim}) ...")
+            fp = np.lib.format.open_memmap(
+                str(emb_s2s3_path), mode='w+', dtype=np.float32, shape=(n_s2s3, dim)
+            )
+            fp[:len(emb_s2)] = emb_s2[:]
+            fp[len(emb_s2):] = emb_s3[:]
+            fp.flush()
+            del fp
+        del emb_s2, emb_s3
+        free_memory()
+        emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
+
+        s1_ids = pp_test_s1.index.values
+        cand_ids = pp_test_s2s3.index.values
+
+        # FAISS embedding blocking
+        emb_candidates, emb_provenance = emb.run_embedding_blocking(
+            s1_ids, cand_ids, emb_s1, emb_s2s3
         )
-        fp[:len(emb_s2)] = emb_s2[:]
-        fp[len(emb_s2):] = emb_s3[:]
-        fp.flush()
-        del fp
-    del emb_s2, emb_s3
-    free_memory()
-    emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
-
-    s1_ids = pp_test_s1.index.values
-    cand_ids = pp_test_s2s3.index.values
-
-    # FAISS embedding blocking
-    emb_candidates, emb_provenance = emb.run_embedding_blocking(
-        s1_ids, cand_ids, emb_s1, emb_s2s3
-    )
-    emb_reciprocal = emb.run_embedding_reciprocal(
-        s1_ids, cand_ids, emb_s1, emb_s2s3, emb_provenance, topk=20
-    )
-    del emb_s1, emb_s2s3
-    free_memory()
+        emb_reciprocal = emb.run_embedding_reciprocal(
+            s1_ids, cand_ids, emb_s1, emb_s2s3, emb_provenance, topk=20
+        )
+        del emb_s1, emb_s2s3
+        free_memory()
 
     # TF-IDF blocking per country
     all_candidates = defaultdict(set)
