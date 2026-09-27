@@ -279,63 +279,96 @@ def run_blocking_phase(pp_train_s1, pp_train_s2s3, ground_truth,
     logger.info(f"Token IDF: {len(token_idf):,} tokens")
 
     # ── TF-IDF + inverted index blocking (per country) ──
+    tfidf_cache = cache / "tfidf_blocking.pkl"
+    if tfidf_cache.exists():
+        logger.info(f"Loading cached TF-IDF blocking results from {tfidf_cache} ...")
+        with open(tfidf_cache, "rb") as f:
+            tfidf_candidates, tfidf_provenance, tfidf_reciprocal = pickle.load(f)
+        logger.info(f"Loaded TF-IDF candidates: {sum(len(v) for v in tfidf_candidates.values()):,} pairs")
+    else:
+        tfidf_candidates = defaultdict(set)
+        tfidf_provenance = defaultdict(dict)
+        tfidf_reciprocal = {}
+
+        countries = pp_train_s1["country"].unique()
+        logger.info(f"Countries: {list(countries)}")
+
+        for country in countries:
+            if not country:
+                continue
+            s1_country = pp_train_s1[pp_train_s1["country"] == country]
+            s2s3_country = pp_train_s2s3[pp_train_s2s3["country"] == country]
+            if len(s1_country) == 0 or len(s2s3_country) == 0:
+                continue
+
+            cands, prov, fwd_cands, nb, sv, sv2 = block.run_blocking(
+                s1_country, s2s3_country, country, token_idf
+            )
+
+            # TF-IDF reciprocal
+            recip = block.run_reciprocal_retrieval(
+                sv, sv2, s1_country.index.values, s2s3_country.index.values,
+                fwd_cands, topk=config.TFIDF_REVERSE_TOPK,
+            )
+
+            for s1_id, c_set in cands.items():
+                tfidf_candidates[s1_id].update(c_set)
+            tfidf_provenance.update(prov)
+            tfidf_reciprocal.update(recip)
+
+            del sv, sv2, nb
+            free_memory()
+
+        # Handle missing country
+        s1_no_country = pp_train_s1[
+            pp_train_s1["country"].isin(["", "nan"]) | pp_train_s1["country"].isna()
+        ]
+        if len(s1_no_country) > 0:
+            logger.info(f"Processing {len(s1_no_country):,} S1 without country ...")
+            c, p, _, _, _, _ = block.run_blocking(s1_no_country, pp_train_s2s3, "UNKNOWN", token_idf)
+            for s1_id, c_set in c.items():
+                tfidf_candidates[s1_id].update(c_set)
+            tfidf_provenance.update(p)
+            free_memory()
+
+        with open(tfidf_cache, "wb") as f:
+            pickle.dump((dict(tfidf_candidates), dict(tfidf_provenance), tfidf_reciprocal), f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"Saved TF-IDF blocking results to {tfidf_cache}")
+
+    # Combine embedding + TF-IDF candidates
     all_candidates = defaultdict(set)
     all_provenance = defaultdict(dict)
-    all_reciprocal = {}
+    all_reciprocal = dict(tfidf_reciprocal)
 
-    # Merge embedding candidates into all_candidates
-    for s1_id, cands in emb_candidates.items():
+    if emb_candidates:
+        for s1_id, cands in emb_candidates.items():
+            all_candidates[s1_id].update(cands)
+        logger.info(f"FAISS candidate pairs: {sum(len(v) for v in all_candidates.values()):,}")
+
+    for s1_id, cands in tfidf_candidates.items():
         all_candidates[s1_id].update(cands)
-    logger.info(f"After FAISS: {sum(len(v) for v in all_candidates.values()):,} pairs")
-
-    countries = pp_train_s1["country"].unique()
-    logger.info(f"Countries: {list(countries)}")
-
-    for country in countries:
-        if not country:
-            continue
-        s1_country = pp_train_s1[pp_train_s1["country"] == country]
-        s2s3_country = pp_train_s2s3[pp_train_s2s3["country"] == country]
-        if len(s1_country) == 0 or len(s2s3_country) == 0:
-            continue
-
-        cands, prov, fwd_cands, nb, sv, sv2 = block.run_blocking(
-            s1_country, s2s3_country, country, token_idf
-        )
-
-        # TF-IDF reciprocal
-        recip = block.run_reciprocal_retrieval(
-            sv, sv2, s1_country.index.values, s2s3_country.index.values,
-            fwd_cands, topk=config.TFIDF_REVERSE_TOPK,
-        )
-
-        for s1_id, c_set in cands.items():
-            all_candidates[s1_id].update(c_set)
-        all_provenance.update(prov)
-        all_reciprocal.update(recip)
-
-        del sv, sv2, nb
-        free_memory()
-
-    # Handle missing country
-    s1_no_country = pp_train_s1[
-        pp_train_s1["country"].isin(["", "nan"]) | pp_train_s1["country"].isna()
-    ]
-    if len(s1_no_country) > 0:
-        logger.info(f"Processing {len(s1_no_country):,} S1 without country ...")
-        c, p, _, _, _, _ = block.run_blocking(s1_no_country, pp_train_s2s3, "UNKNOWN", token_idf)
-        for s1_id, c_set in c.items():
-            all_candidates[s1_id].update(c_set)
-        all_provenance.update(p)
-        free_memory()
+    all_provenance.update(tfidf_provenance)
 
     total = sum(len(v) for v in all_candidates.values())
     logger.info(f"\nTotal blocking pairs: {total:,}")
     block.evaluate_blocking_recall(dict(all_candidates), ground_truth)
 
-    # Save blocking results
-    recs = [{"s1_id": s1, "cand_id": c} for s1, cs in all_candidates.items() for c in cs]
-    pd.DataFrame(recs).to_parquet(cache / "blocking_candidates.parquet")
+    # Save blocking results efficiently (no giant list of 30M dicts)
+    s1_flat = []
+    cand_flat = []
+    for s1, cs in all_candidates.items():
+        s1_flat.extend([s1] * len(cs))
+        cand_flat.extend(cs)
+    df_cands = pd.DataFrame({"s1_id": s1_flat, "cand_id": cand_flat})
+    df_cands.to_parquet(cache / "blocking_candidates.parquet", compression="snappy")
+    del s1_flat, cand_flat, df_cands
+    free_memory()
+
+    # Save provenance and reciprocal features to disk for features phase
+    prov_cache = cache / "blocking_provenance.pkl"
+    with open(prov_cache, "wb") as f:
+        pickle.dump((dict(all_provenance), all_reciprocal, emb_provenance, emb_reciprocal), f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info(f"Saved blocking provenance to {prov_cache}")
 
     return (dict(all_candidates), dict(all_provenance), all_reciprocal,
             emb_provenance, emb_reciprocal, token_idf)
@@ -733,17 +766,35 @@ def main():
         gt = load_ground_truth(config.TRAIN_GT)
 
         if args.phase == "blocking":
-            emb_cands, emb_prov, emb_recip = run_faiss_blocking()
+            faiss_cache = config.CACHE_DIR / "faiss_blocking.pkl"
+            if faiss_cache.exists():
+                emb_cands, emb_prov, emb_recip = run_faiss_blocking()
+            else:
+                logger.info("faiss_blocking.pkl not found yet; running TF-IDF blocking only ...")
+                emb_cands, emb_prov, emb_recip = {}, {}, {}
             s2s3 = pd.concat([pp_s2, pp_s3])
             run_blocking_phase(pp_s1, s2s3, gt, emb_cands, emb_prov, emb_recip)
         elif args.phase == "features":
             cdf = pd.read_parquet(config.CACHE_DIR / "blocking_candidates.parquet")
             cands = defaultdict(set)
-            for _, r in cdf.iterrows():
-                cands[r["s1_id"]].add(r["cand_id"])
+            for s1_val, cand_val in zip(cdf["s1_id"].values, cdf["cand_id"].values):
+                cands[s1_val].add(cand_val)
+            del cdf
+            free_memory()
+
             idf = pd.read_parquet(config.CACHE_DIR / "token_idf.parquet")["idf"].to_dict()
             s2s3 = pd.concat([pp_s2, pp_s3])
-            run_features_phase(pp_s1, s2s3, dict(cands), {}, {}, {}, {}, idf, gt)
+
+            prov_cache = config.CACHE_DIR / "blocking_provenance.pkl"
+            if prov_cache.exists():
+                logger.info(f"Loading blocking provenance from {prov_cache} ...")
+                with open(prov_cache, "rb") as f:
+                    provenance, reciprocal, emb_prov, emb_recip = pickle.load(f)
+            else:
+                logger.warning("blocking_provenance.pkl not found; proceeding with empty provenance")
+                provenance, reciprocal, emb_prov, emb_recip = {}, {}, {}, {}
+
+            run_features_phase(pp_s1, s2s3, dict(cands), provenance, reciprocal, emb_prov, emb_recip, idf, gt)
         elif args.phase == "train":
             fdf = pd.read_parquet(config.CACHE_DIR / "train_features.parquet")
             run_training_phase(fdf, gt)
