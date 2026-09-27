@@ -257,7 +257,7 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
     logger.info(f"  Strategy 1: TF-IDF Name blocking ...")
     name_blocker = TFIDFBlocker(
         "name", analyzer="word",
-        ngram_range=(1, 2),
+        ngram_range=(1, 1),
         max_features=config.TFIDF_NAME_MAX_FEATURES,
     )
     all_names = pd.concat([s1_df["name_clean"], s2s3_df["name_clean"]])
@@ -293,36 +293,36 @@ def run_blocking(s1_df: pd.DataFrame, s2s3_df: pd.DataFrame,
 
     logger.info(f"  After name TF-IDF: {sum(len(v) for v in all_candidates.values()):,} pairs")
 
-    # ── Strategy 2: TF-IDF address blocking ──
-    logger.info(f"  Strategy 2: TF-IDF Address blocking ...")
-    addr_blocker = TFIDFBlocker(
-        "addr", analyzer="word", ngram_range=(1, 2),
-        max_features=config.TFIDF_ADDR_MAX_FEATURES,
-    )
-    all_addrs = pd.concat([s1_df["addr_clean"], s2s3_df["addr_clean"]])
-    # Only fit on non-empty addresses
-    addr_blocker.fit(all_addrs[all_addrs.str.len() > 0])
+    # ── Strategy 2: TF-IDF address blocking (Optional - FAISS already captures address semantics) ──
+    if getattr(config, "ENABLE_ADDR_TFIDF_BLOCKING", False):
+        logger.info(f"  Strategy 2: TF-IDF Address blocking ...")
+        addr_blocker = TFIDFBlocker(
+            "addr", analyzer="word", ngram_range=(1, 2),
+            max_features=config.TFIDF_ADDR_MAX_FEATURES,
+        )
+        all_addrs = pd.concat([s1_df["addr_clean"], s2s3_df["addr_clean"]])
+        addr_blocker.fit(all_addrs[all_addrs.str.len() > 0])
 
-    s1_addr_vecs = addr_blocker.transform(s1_df["addr_clean"])
-    s2s3_addr_vecs = addr_blocker.transform(s2s3_df["addr_clean"])
+        s1_addr_vecs = addr_blocker.transform(s1_df["addr_clean"])
+        s2s3_addr_vecs = addr_blocker.transform(s2s3_df["addr_clean"])
 
-    addr_k = max(20, median_k // 2)
-    addr_sim = addr_blocker.retrieve_topk(
-        s1_addr_vecs, s2s3_addr_vecs,
-        topk=addr_k, min_sim=config.TFIDF_MIN_SIMILARITY,
-    )
-    addr_candidates = sparse_to_candidates(addr_sim, s1_ids, cand_ids)
+        addr_k = max(20, median_k // 2)
+        addr_sim = addr_blocker.retrieve_topk(
+            s1_addr_vecs, s2s3_addr_vecs,
+            topk=addr_k, min_sim=config.TFIDF_MIN_SIMILARITY,
+        )
+        addr_candidates = sparse_to_candidates(addr_sim, s1_ids, cand_ids)
 
-    for s1_id, cands in addr_candidates.items():
-        for cand_id, rank, score in cands:
-            all_candidates[s1_id].add(cand_id)
-            prov = provenance[(s1_id, cand_id)]
-            prov["addr_tfidf_hit"] = True
-            prov["addr_tfidf_rank"] = rank
+        for s1_id, cands in addr_candidates.items():
+            for cand_id, rank, score in cands:
+                all_candidates[s1_id].add(cand_id)
+                prov = provenance[(s1_id, cand_id)]
+                prov["addr_tfidf_hit"] = True
+                prov["addr_tfidf_rank"] = rank
 
-    del addr_sim, addr_candidates
-    gc.collect()
-    logger.info(f"  After addr TF-IDF: {sum(len(v) for v in all_candidates.values()):,} pairs")
+        del addr_sim, addr_candidates
+        gc.collect()
+        logger.info(f"  After addr TF-IDF: {sum(len(v) for v in all_candidates.values()):,} pairs")
 
     max_bucket = getattr(config, "INVERTED_INDEX_MAX_BUCKET", 200)
     max_cands = getattr(config, "BLOCKING_MAX_CANDS_PER_ENTITY", 50)
