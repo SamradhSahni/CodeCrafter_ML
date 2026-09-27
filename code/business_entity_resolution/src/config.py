@@ -111,9 +111,10 @@ US_STATE_ABBREV = {
 # ──────────────────────────────────────────────
 #  TF-IDF Blocking (secondary retrieval)
 # ──────────────────────────────────────────────
-TFIDF_NAME_NGRAM_RANGE = (3, 5)
-TFIDF_NAME_MAX_FEATURES = 500_000
-TFIDF_ADDR_MAX_FEATURES = 300_000
+TFIDF_NAME_NGRAM_RANGE = (3, 4)
+TFIDF_NAME_MAX_FEATURES = 100_000
+TFIDF_ADDR_MAX_FEATURES = 50_000
+TFIDF_MAX_FIT_SAMPLES = 500_000
 TFIDF_MIN_SIMILARITY = 0.3
 TFIDF_REVERSE_TOPK = 20
 
@@ -121,10 +122,10 @@ DEFAULT_K_CONFIG = {
     'unique_idf_thresh': 8.0,
     'normal_idf_thresh': 5.0,
     'common_idf_thresh': 3.0,
-    'unique_k': 15,
-    'normal_k': 30,
-    'common_k': 50,
-    'max_k': 100,
+    'unique_k': 10,
+    'normal_k': 20,
+    'common_k': 30,
+    'max_k': 50,
 }
 
 # ──────────────────────────────────────────────

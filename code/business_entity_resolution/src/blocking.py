@@ -10,6 +10,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
@@ -74,7 +75,7 @@ class TFIDFBlocker:
     """TF-IDF based candidate retrieval using sparse_dot_topn."""
 
     def __init__(self, field: str, analyzer: str = "char_wb",
-                 ngram_range=(3, 5), max_features=500_000):
+                 ngram_range=(3, 4), max_features=100_000):
         self.field = field
         self.vectorizer = TfidfVectorizer(
             analyzer=analyzer,
@@ -85,12 +86,16 @@ class TFIDFBlocker:
         )
         self.is_fitted = False
 
-    def fit(self, all_texts: pd.Series):
-        """Fit on all texts (S1 + S2 + S3) for consistent vocabulary."""
-        logger.info(f"Fitting TF-IDF ({self.field}): {len(all_texts):,} texts ...")
-        # Filter empty strings
+    def fit(self, all_texts: pd.Series, max_samples: int = None):
+        """Fit on a representative subsample of texts for consistent vocabulary with minimal RAM."""
+        max_samples = max_samples or getattr(config, "TFIDF_MAX_FIT_SAMPLES", 500_000)
+        logger.info(f"Fitting TF-IDF ({self.field}): {len(all_texts):,} texts (sample limit: {max_samples:,}) ...")
         valid = all_texts[all_texts.str.len() > 0]
-        self.vectorizer.fit(valid)
+        if len(valid) > max_samples:
+            fit_sample = valid.sample(max_samples, random_state=getattr(config, "RANDOM_SEED", 42))
+        else:
+            fit_sample = valid
+        self.vectorizer.fit(fit_sample)
         self.is_fitted = True
         self.idf_ = dict(zip(
             self.vectorizer.get_feature_names_out(),
@@ -98,30 +103,71 @@ class TFIDFBlocker:
         ))
         logger.info(f"  -> vocabulary size: {len(self.vectorizer.vocabulary_):,}")
 
-    def transform(self, texts: pd.Series) -> csr_matrix:
-        """Transform texts to TF-IDF vectors."""
-        return self.vectorizer.transform(texts.fillna(""))
+    def transform(self, texts: pd.Series, chunk_size: int = 500_000) -> csr_matrix:
+        """Transform texts to TF-IDF vectors in memory-safe chunks."""
+        valid = texts.fillna("")
+        n = len(valid)
+        if n <= chunk_size:
+            return self.vectorizer.transform(valid)
+        chunks = []
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk = self.vectorizer.transform(valid.iloc[start:end])
+            chunks.append(chunk)
+        return sp.vstack(chunks, format="csr")
 
     def retrieve_topk(self, query_vecs: csr_matrix, corpus_vecs: csr_matrix,
-                      topk: int, min_sim: float = 0.3, n_jobs: int = 4):
+                      topk: int, min_sim: float = 0.3, n_jobs: int = 4,
+                      batch_size: int = 200_000):
         """
-        Retrieve top-K candidates for each query from corpus.
+        Retrieve top-K candidates for each query from corpus in memory-safe batches.
         Returns sparse matrix (n_queries x n_corpus) with similarities.
         """
-        logger.info(f"TF-IDF retrieval ({self.field}): {query_vecs.shape[0]:,} queries x "
+        n_queries = query_vecs.shape[0]
+        logger.info(f"TF-IDF retrieval ({self.field}): {n_queries:,} queries x "
                      f"{corpus_vecs.shape[0]:,} corpus, top-{topk} ...")
-        try:
-            result = awesome_cossim_topn(
-                query_vecs, corpus_vecs.T,
-                ntop=topk, lower_bound=min_sim,
-                use_threads=True, n_jobs=n_jobs,
-            )
-        except TypeError:
-            # Older sparse_dot_topn API
-            result = awesome_cossim_topn(
-                query_vecs, corpus_vecs.T,
-                ntop=topk, lower_bound=min_sim,
-            )
+        
+        if n_queries <= batch_size:
+            try:
+                result = awesome_cossim_topn(
+                    query_vecs, corpus_vecs.T,
+                    ntop=topk, lower_bound=min_sim,
+                    use_threads=True, n_jobs=n_jobs,
+                )
+            except TypeError:
+                result = awesome_cossim_topn(
+                    query_vecs, corpus_vecs.T,
+                    ntop=topk, lower_bound=min_sim,
+                )
+            logger.info(f"  -> {result.nnz:,} candidate pairs")
+            return result
+
+        # Batch query matrix to keep memory minimal
+        results = []
+        corpus_T = corpus_vecs.T.tocsc()
+        for start in range(0, n_queries, batch_size):
+            end = min(start + batch_size, n_queries)
+            sub_query = query_vecs[start:end]
+            try:
+                sub_res = awesome_cossim_topn(
+                    sub_query, corpus_T,
+                    ntop=topk, lower_bound=min_sim,
+                    use_threads=True, n_jobs=n_jobs,
+                )
+            except TypeError:
+                sub_res = awesome_cossim_topn(
+                    sub_query, corpus_T,
+                    ntop=topk, lower_bound=min_sim,
+                )
+            results.append(sub_res)
+            del sub_query
+            gc.collect()
+
+        del corpus_T
+        gc.collect()
+        result = sp.vstack(results, format="csr")
+        del results
+        gc.collect()
         logger.info(f"  -> {result.nnz:,} candidate pairs")
         return result
 
@@ -132,21 +178,24 @@ class TFIDFBlocker:
 def sparse_to_candidates(sim_matrix, s1_ids, cand_ids):
     """
     Convert a sparse similarity matrix to a dict of candidates with ranks.
-    Returns: {s1_id: [(cand_id, rank, score), ...]}
+    Memory-efficient: reads directly from CSR indptr, indices, data without getrow allocations.
     """
     candidates = defaultdict(list)
+    indptr = sim_matrix.indptr
+    indices = sim_matrix.indices
+    data = sim_matrix.data
+
     for i in range(sim_matrix.shape[0]):
-        row = sim_matrix.getrow(i)
-        if row.nnz == 0:
+        start, end = indptr[i], indptr[i + 1]
+        if start == end:
             continue
-        indices = row.indices
-        scores = row.data
-        # Sort by score descending
+        row_indices = indices[start:end]
+        scores = data[start:end]
         order = np.argsort(-scores)
         s1_id = s1_ids[i]
-        for rank, j in enumerate(order):
-            cand_id = cand_ids[indices[j]]
-            candidates[s1_id].append((cand_id, rank, float(scores[j])))
+        for rank, pos in enumerate(order):
+            cand_id = cand_ids[row_indices[pos]]
+            candidates[s1_id].append((cand_id, rank, float(scores[pos])))
     return candidates
 
 
