@@ -4,6 +4,7 @@ Phase 3: Feature engineering — 60+ features across 8 categories.
 All features are computed ONLY for candidate pairs from blocking (Phase 2).
 """
 import gc
+import os
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
@@ -275,6 +276,32 @@ def compute_pair_features(s1_rec: dict, cand_rec: dict,
 
 # ──────────────────────────────────────────────
 #  Batch feature computation
+def _process_pair_slice(slice_pairs, s1_records, cand_records,
+                        prov_dict, recip_dict, token_idf,
+                        emb_prov_dict, emb_recip_dict):
+    """Worker function to compute features for a slice of pairs."""
+    feature_rows = []
+    for s1_id, cand_id in slice_pairs:
+        s1_rec = s1_records.get(s1_id, {})
+        cand_rec = dict(cand_records.get(cand_id, {}))
+        cand_rec["entity_id_prefix"] = cand_id[:2] if cand_id else ""
+
+        prov = prov_dict.get((s1_id, cand_id), {})
+        recip = recip_dict.get((s1_id, cand_id), {})
+        ep = emb_prov_dict.get((s1_id, cand_id), {})
+        er = emb_recip_dict.get((s1_id, cand_id), {})
+
+        feats = compute_pair_features(
+            s1_rec, cand_rec, prov, recip, token_idf,
+            embedding_provenance=ep,
+            embedding_reciprocal=er,
+        )
+        feats["s1_id"] = s1_id
+        feats["cand_id"] = cand_id
+        feature_rows.append(feats)
+    return feature_rows
+
+
 # ──────────────────────────────────────────────
 #  Batch feature computation
 # ──────────────────────────────────────────────
@@ -287,7 +314,7 @@ def compute_features_batch(pairs: list, s1_df: pd.DataFrame, s2s3_df: pd.DataFra
     """
     Compute features for all candidate pairs with minimal memory footprint.
     Pre-extracts record dicts to eliminate slow/memory-heavy .loc lookups,
-    processes in chunks, and downcasts numeric features to float32.
+    processes in chunks with multi-core parallelization, and downcasts numeric features to float32.
     """
     logger.info(f"Computing features for {len(pairs):,} pairs ...")
     embedding_provenance = embedding_provenance or {}
@@ -315,32 +342,32 @@ def compute_features_batch(pairs: list, s1_df: pd.DataFrame, s2s3_df: pd.DataFra
 
     chunk_dfs = []
     n_pairs = len(pairs)
+    n_workers = getattr(config, "N_JOBS", 1)
 
     for start in range(0, n_pairs, chunk_size):
         end = min(start + chunk_size, n_pairs)
         batch_pairs = pairs[start:end]
-        feature_rows = []
 
-        for s1_id, cand_id in batch_pairs:
-            s1_rec = s1_records.get(s1_id, {})
-            cand_rec = dict(cand_records.get(cand_id, {}))
-
-            # Add entity_id prefix for source_type feature
-            cand_rec["entity_id_prefix"] = cand_id[:2] if cand_id else ""
-
-            prov = provenance.get((s1_id, cand_id), {})
-            recip = reciprocal.get((s1_id, cand_id), {})
-            emb_prov = embedding_provenance.get((s1_id, cand_id), {})
-            emb_recip = embedding_reciprocal.get((s1_id, cand_id), {})
-
-            feats = compute_pair_features(
-                s1_rec, cand_rec, prov, recip, token_idf,
-                embedding_provenance=emb_prov,
-                embedding_reciprocal=emb_recip,
+        if n_workers > 1 and len(batch_pairs) >= 5000:
+            from joblib import Parallel, delayed
+            sub_step = max(500, len(batch_pairs) // n_workers)
+            sub_slices = [batch_pairs[i:i + sub_step] for i in range(0, len(batch_pairs), sub_step)]
+            sub_results = Parallel(n_jobs=n_workers, prefer="threads" if os.name == "nt" else "processes")(
+                delayed(_process_pair_slice)(
+                    sl, s1_records, cand_records,
+                    provenance, reciprocal, token_idf,
+                    embedding_provenance, embedding_reciprocal
+                )
+                for sl in sub_slices
             )
-            feats["s1_id"] = s1_id
-            feats["cand_id"] = cand_id
-            feature_rows.append(feats)
+            feature_rows = [item for sub in sub_results for item in sub]
+            del sub_results
+        else:
+            feature_rows = _process_pair_slice(
+                batch_pairs, s1_records, cand_records,
+                provenance, reciprocal, token_idf,
+                embedding_provenance, embedding_reciprocal
+            )
 
         chunk_df = pd.DataFrame(feature_rows)
         del feature_rows

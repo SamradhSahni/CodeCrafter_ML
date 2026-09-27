@@ -33,29 +33,55 @@ MODEL_DIR = PROJECT_ROOT / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # ──────────────────────────────────────────────
-#  GPU Detection
+#  Hardware & Environment Detection (Local vs AWS Cloud)
 # ──────────────────────────────────────────────
 try:
     import torch
     HAS_CUDA = torch.cuda.is_available()
     DEVICE = "cuda" if HAS_CUDA else "cpu"
     GPU_NAME = torch.cuda.get_device_name(0) if HAS_CUDA else "CPU"
+    GPU_VRAM_GB = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3) if HAS_CUDA else 0.0
 except ImportError:
     HAS_CUDA = False
     DEVICE = "cpu"
     GPU_NAME = "CPU (torch not installed)"
+    GPU_VRAM_GB = 0.0
+
+try:
+    import psutil
+    TOTAL_RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
+except ImportError:
+    TOTAL_RAM_GB = 16.0
+
+CPU_COUNT = os.cpu_count() or 4
+IS_HIGH_COMPUTE = (TOTAL_RAM_GB >= 30.0) or (GPU_VRAM_GB >= 15.0)
 
 # ──────────────────────────────────────────────
-#  Embedding Model Config
+#  Dynamic Parameter Scaling
 # ──────────────────────────────────────────────
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim, fast, reliable
 EMBEDDING_DIM = 384
-EMBEDDING_BATCH_SIZE = 1024 if HAS_CUDA else 256
-FAISS_TOP_K = 10                     # top-K from dense retrieval (top 10 dense candidates per entity)
-FAISS_NPROBE = 32                    # IVF search granularity (fast CPU search)
-FAISS_MIN_SIMILARITY = 0.50          # empirical 98.3% coverage of true matches; prunes noise pairs
-BLOCKING_MAX_CANDS_PER_ENTITY = 50   # max candidates per S1 entity across all blockers
-INVERTED_INDEX_MAX_BUCKET = 200      # max bucket size to prevent non-selective combinatorial explosion
+
+if IS_HIGH_COMPUTE:
+    # High-performance cloud specs (AWS g5.2xlarge/g5.4xlarge: 32-64GB RAM, 24GB A10G GPU)
+    EMBEDDING_BATCH_SIZE = 2048 if HAS_CUDA else 512
+    FAISS_TOP_K = 20
+    FAISS_NPROBE = 64
+    FAISS_MIN_SIMILARITY = 0.45
+    BLOCKING_MAX_CANDS_PER_ENTITY = 60
+    INVERTED_INDEX_MAX_BUCKET = 300
+    TFIDF_NAME_MAX_FEATURES = 200_000
+    N_JOBS = CPU_COUNT
+else:
+    # Local laptop / constrained hardware mode
+    EMBEDDING_BATCH_SIZE = 1024 if HAS_CUDA else 256
+    FAISS_TOP_K = 10
+    FAISS_NPROBE = 32
+    FAISS_MIN_SIMILARITY = 0.50
+    BLOCKING_MAX_CANDS_PER_ENTITY = 50
+    INVERTED_INDEX_MAX_BUCKET = 200
+    TFIDF_NAME_MAX_FEATURES = 100_000
+    N_JOBS = max(1, CPU_COUNT - 1)
 
 # ──────────────────────────────────────────────
 #  Legal suffixes vs generic business tokens
