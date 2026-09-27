@@ -266,6 +266,7 @@ def run_blocking_phase(pp_train_s1, pp_train_s2s3, ground_truth,
     logger.info("=" * 60)
     logger.info("PHASE 3: BLOCKING (TF-IDF + INVERTED INDEX)")
     logger.info("=" * 60)
+    cache = config.CACHE_DIR
 
     # Country gate
     cross_rate = verify_country_gate(ground_truth, pp_train_s1, pp_train_s2s3)
