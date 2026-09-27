@@ -226,12 +226,23 @@ def run_faiss_blocking():
     free_memory()
     emb_s2s3 = np.load(str(emb_s2s3_path), mmap_mode="r")
 
-    # FAISS blocking
-    emb_candidates, emb_provenance = emb.run_embedding_blocking(
-        s1_ids, cand_ids, emb_s1, emb_s2s3, topk=config.FAISS_TOP_K
-    )
+    # FAISS forward blocking (with checkpointing)
+    import pickle
+    faiss_fwd_cache = cache / "faiss_forward.pkl"
+    if faiss_fwd_cache.exists():
+        logger.info(f"Loading cached forward FAISS results from {faiss_fwd_cache} ...")
+        with open(faiss_fwd_cache, "rb") as f:
+            emb_candidates, emb_provenance = pickle.load(f)
+        logger.info(f"Loaded {len(emb_candidates):,} S1 forward candidates ({len(emb_provenance):,} pairs)")
+    else:
+        emb_candidates, emb_provenance = emb.run_embedding_blocking(
+            s1_ids, cand_ids, emb_s1, emb_s2s3, topk=config.FAISS_TOP_K
+        )
+        with open(faiss_fwd_cache, "wb") as f:
+            pickle.dump((emb_candidates, emb_provenance), f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"Forward FAISS checkpoint saved to {faiss_fwd_cache}")
 
-    # Reciprocal retrieval
+    # Reciprocal retrieval (memory-efficient streamed)
     emb_reciprocal = emb.run_embedding_reciprocal(
         s1_ids, cand_ids, emb_s1, emb_s2s3, emb_provenance, topk=20
     )
@@ -239,11 +250,10 @@ def run_faiss_blocking():
     del emb_s1, emb_s2s3
     free_memory()
 
-    # Cache FAISS results to disk
-    import pickle
+    # Cache complete FAISS results to disk
     result = (emb_candidates, emb_provenance, emb_reciprocal)
     with open(faiss_cache, "wb") as f:
-        pickle.dump(result, f)
+        pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
     logger.info(f"FAISS blocking saved: {len(emb_candidates):,} S1 entities with candidates")
 
     return result

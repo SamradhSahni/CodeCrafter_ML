@@ -265,7 +265,7 @@ def compute_pair_features(s1_rec: dict, cand_rec: dict,
     else:
         feats["embedding_cosine_sim"] = 0.0
         feats["embedding_rank"] = 999
-    feats["emb_fwd_rank"] = emb_recip.get("emb_fwd_rank", 999)
+    feats["emb_fwd_rank"] = emb_recip.get("emb_fwd_rank", feats["embedding_rank"])
     feats["emb_rev_rank"] = emb_recip.get("emb_rev_rank", -1)
     feats["emb_mutual_top1"] = 1.0 if emb_recip.get("emb_mutual_top1", False) else 0.0
     feats["emb_mutual_top5"] = 1.0 if emb_recip.get("emb_mutual_top5", False) else 0.0

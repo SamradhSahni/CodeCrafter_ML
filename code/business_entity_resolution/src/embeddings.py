@@ -317,10 +317,10 @@ def run_embedding_reciprocal(s1_ids: np.ndarray, cand_ids: np.ndarray,
     # Build index on S1
     index_s1 = build_faiss_index(s1_embeddings)
 
-    # Search in batches directly from cand_embeddings mmap
+    # Streamed reverse search: match against forward_provenance on the fly (near-zero RAM)
     n_queries = len(unique_cand_ids)
     batch_size = 10_000
-    reverse_ranks = {}  # cand_id -> {s1_id: rank}
+    reciprocal = {}
 
     for start in tqdm(range(0, n_queries, batch_size), desc="FAISS reverse search"):
         end = min(start + batch_size, n_queries)
@@ -331,43 +331,32 @@ def run_embedding_reciprocal(s1_ids: np.ndarray, cand_ids: np.ndarray,
 
         for local_i, global_i in enumerate(range(start, end)):
             cid = unique_cand_ids[global_i]
-            rank_map = {}
             for rank in range(topk):
                 s1_idx = int(indices[local_i, rank])
                 if 0 <= s1_idx < len(s1_ids):
-                    rank_map[s1_ids[s1_idx]] = rank
-            if rank_map:
-                reverse_ranks[cid] = rank_map
+                    s1_id = s1_ids[s1_idx]
+                    pair = (s1_id, cid)
+                    if pair in forward_provenance and pair not in reciprocal:
+                        prov = forward_provenance[pair]
+                        fwd_rank = prov[0] if isinstance(prov, (tuple, list)) else prov.get("embedding_rank", 999)
+                        reciprocal[pair] = {
+                            "emb_fwd_rank": fwd_rank,
+                            "emb_rev_rank": rank,
+                            "emb_mutual_top1": (fwd_rank == 0 and rank == 0),
+                            "emb_mutual_top5": (fwd_rank < 5 and rank < 5),
+                            "emb_reciprocal_product": (
+                                (1.0 / (fwd_rank + 1)) * (1.0 / (rank + 1))
+                            ),
+                        }
         del indices
 
-    # Clean up index early
-    del index_s1
+    # Clean up index
+    del index_s1, cand_id_to_idx, unique_cand_indices, unique_cand_ids
     gc.collect()
     if config.HAS_CUDA:
         torch.cuda.empty_cache()
 
-    # Join forward + reverse
-    reciprocal = {}
-    for (s1_id, cand_id), prov in forward_provenance.items():
-        fwd_rank = prov[0] if isinstance(prov, (tuple, list)) else prov.get("embedding_rank", 999)
-        rev_rank_map = reverse_ranks.get(cand_id, {})
-        rev_rank = rev_rank_map.get(s1_id, -1)
-
-        reciprocal[(s1_id, cand_id)] = {
-            "emb_fwd_rank": fwd_rank,
-            "emb_rev_rank": rev_rank,
-            "emb_mutual_top1": (fwd_rank == 0 and rev_rank == 0),
-            "emb_mutual_top5": (fwd_rank < 5 and 0 <= rev_rank < 5),
-            "emb_reciprocal_product": (
-                (1.0 / (fwd_rank + 1)) * (1.0 / (rev_rank + 1))
-                if rev_rank >= 0 else 0.0
-            ),
-        }
-
-    del reverse_ranks, cand_id_to_idx, unique_cand_indices, unique_cand_ids
-    gc.collect()
-
-    logger.info(f"Embedding reciprocal: {len(reciprocal):,} pairs with features")
+    logger.info(f"Embedding reciprocal: {len(reciprocal):,} mutual pairs identified")
     return reciprocal
 
 
